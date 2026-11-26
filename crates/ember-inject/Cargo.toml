@@ -6,8 +6,21 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "ember"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# windows-sys added when we implement injection (CreateProcessW, QueueUserAPC, ...)
+windows-sys = { version = "0.59", features = [
+    "Win32_Security",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_UI_WindowsAndMessaging",
+] }
