@@ -9,9 +9,9 @@ from the command line.
 1. **Welcome** -- title and one-liner.
 2. **How it works** -- explains that Discord must be opened through Ember.
 3. **Terms** -- disclaimer; a checkbox gates the Next button.
-4. **Options** -- "Pin to taskbar" and "Add to desktop", both checked by default.
+4. **Options** -- "Add to desktop", checked by default.
 5. **Installing** -- brief progress, auto-advances.
-6. **Done** -- optional "Launch Ember now" checkbox, Finish button.
+6. **Done** -- optional "Launch Ember now" checkbox, pin-from-Start-Menu tip, Finish button.
 
 Back/Next navigation on every applicable page. Cancel or the X button closes the
 wizard at any time.
@@ -29,10 +29,18 @@ wizard at any time.
      - `Description` = `Discord (Ember)`
    - Paths reach the PowerShell script through environment variables, never
      interpolated into the script text.
-3. Attempts to pin the Start Menu shortcut to the taskbar using the shell
-   `taskbarpin` verb. This verb was removed in Windows 10 1903+, so on most
-   modern builds the attempt silently fails and the Done page tells the user to
-   drag the shortcut to the taskbar manually.
+3. Sets `System.AppUserModel.ID` on each Ember shortcut to match Discord
+   Phoenix's AppUserModelID, so Windows groups Ember's shortcut and Discord's
+   running window into one taskbar button. The AUMID is read from Discord
+   Phoenix's own Start Menu shortcut at install time; if that fails, a
+   Squirrel-convention fallback (`com.squirrel.DiscordPhoenix.Discord`) is
+   used. This step is best-effort -- if it fails, shortcuts still work but may
+   show a separate taskbar icon.
+   **Reliability**: the AUMID must match what Discord's Electron process sets
+   at runtime via `app.setAppUserModelId`. If Discord changes its AUMID in a
+   future update, the fallback constant `DISCORD_AUMID_FALLBACK` in
+   `install.rs` needs updating. Discovery from Discord's shortcut adapts
+   automatically as long as that shortcut exists.
 4. The install is idempotent: re-running it updates the copied files and
    overwrites the existing shortcuts (no duplicates).
 
@@ -69,7 +77,7 @@ modifies Discord on disk.
 - [ ] Walk through all 6 pages with Back/Next; verify the agree checkbox gates Next on page 3.
 - [ ] Complete the install; verify files appear in `%LOCALAPPDATA%\Ember\`.
 - [ ] Check that Start Menu and Desktop shortcuts exist and point at the installed exe.
-- [ ] Launch from the Start Menu shortcut -- Discord should open unlocked.
+- [ ] Launch from the Start Menu shortcut -- Discord should open unlocked, with ONE taskbar icon (Ember + Discord grouped).
 - [ ] Run the installed `ember-launcher.exe` directly -- should inject (no wizard).
 - [ ] Run `ember-launcher.exe --uninstall` -- shortcuts and directory removed.
 - [ ] Run the installer again (idempotent) -- no duplicate shortcuts.

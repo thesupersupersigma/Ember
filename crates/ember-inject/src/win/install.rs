@@ -25,16 +25,12 @@ pub fn shortcut_icon_location(local_appdata: &Path) -> String {
 // ── Options / actions ───────────────────────────────────────────────────
 
 pub struct InstallOptions {
-    pub pin_taskbar: bool,
     pub add_desktop: bool,
 }
 
 impl Default for InstallOptions {
     fn default() -> Self {
-        Self {
-            pin_taskbar: true,
-            add_desktop: true,
-        }
+        Self { add_desktop: true }
     }
 }
 
@@ -43,14 +39,12 @@ pub struct InstallActions {
     #[allow(dead_code)] // used by unit tests in mod.rs
     pub create_start_menu: bool,
     pub create_desktop: bool,
-    pub attempt_pin: bool,
 }
 
 pub fn actions_from_options(opts: &InstallOptions) -> InstallActions {
     InstallActions {
         create_start_menu: true, // always
         create_desktop: opts.add_desktop,
-        attempt_pin: opts.pin_taskbar,
     }
 }
 
@@ -66,9 +60,8 @@ fn ember_dir() -> Result<PathBuf> {
     Ok(install_dir_from(&local_appdata()?))
 }
 
-/// Install: copy files, create shortcuts.
-/// Returns `true` if taskbar pinning was attempted but failed.
-pub fn do_install(opts: &InstallOptions) -> Result<bool> {
+/// Install: copy files, create shortcuts, set AUMID for taskbar grouping.
+pub fn do_install(opts: &InstallOptions) -> Result<()> {
     let local = local_appdata()?;
     let dest = install_dir_from(&local);
     fs::create_dir_all(&dest).map_err(|e| format!("creating {}: {e}", dest.display()))?;
@@ -97,13 +90,10 @@ pub fn do_install(opts: &InstallOptions) -> Result<bool> {
     let actions = actions_from_options(opts);
     create_shortcuts(&dest_exe, &local, actions.create_desktop)?;
 
-    // Attempt taskbar pin (silently fail on modern Win10)
-    let mut pin_failed = false;
-    if actions.attempt_pin && pin_to_taskbar().is_err() {
-        pin_failed = true;
-    }
+    // Best-effort AUMID grouping — failure is not an install error
+    set_shortcut_aumid(actions.create_desktop);
 
-    Ok(pin_failed)
+    Ok(())
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -152,32 +142,106 @@ fn create_shortcuts(launcher: &Path, local_appdata: &Path, desktop: bool) -> Res
     Ok(())
 }
 
-/// Try to pin the Start Menu shortcut to the taskbar using the shell verb.
-/// shortcut: verb removed in Win10 1903+, silently fails on those builds
-fn pin_to_taskbar() -> Result<()> {
+/// AppUserModelID fallback; follows Squirrel convention com.squirrel.<AppDir>.<Exe>.
+/// shortcut: may drift if Discord changes its AUMID; discovery reads theirs first
+pub const DISCORD_AUMID_FALLBACK: &str = "com.squirrel.DiscordPhoenix.Discord";
+
+/// Best-effort: set AppUserModelID on Ember shortcuts so Windows groups them
+/// with Discord's window on the taskbar.  Uses COM `IPropertyStore` via a
+/// small C# helper compiled by `Add-Type`.  Discovers Discord Phoenix's AUMID
+/// from its own Start Menu shortcut; falls back to `DISCORD_AUMID_FALLBACK`.
+fn set_shortcut_aumid(desktop: bool) {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
-    let script = "\
-        $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Ember.lnk'; \
-        if (-not (Test-Path $lnk)) { exit 1 }; \
-        $shell = New-Object -ComObject Shell.Application; \
-        $dir = $shell.Namespace((Split-Path $lnk)); \
-        $item = $dir.ParseName((Split-Path -Leaf $lnk)); \
-        $verb = $item.Verbs() | Where-Object { $_.Name -match 'taskbar' }; \
-        if ($verb) { $verb.DoIt() } else { exit 1 }";
-
-    let status = Command::new(super::powershell_path())
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(0x0800_0000)
-        .status()
-        .map_err(|e| format!("taskbar pin: {e}"))?;
-
-    if !status.success() {
-        return Err("pin verb not available".into());
-    }
-    Ok(())
+    let _ = Command::new(super::powershell_path())
+        .args(["-NoProfile", "-NonInteractive", "-Command", AUMID_SCRIPT])
+        .env("EMBER_AUMID_FALLBACK", DISCORD_AUMID_FALLBACK)
+        .env("EMBER_AUMID_DESKTOP", if desktop { "1" } else { "0" })
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .status();
 }
+
+const AUMID_SCRIPT: &str = r#"try {
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class LnkAumid {
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")] class ShellLink {}
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore {
+        [PreserveSig] int GetCount(out uint c);
+        [PreserveSig] int GetAt(uint i, out PropertyKey k);
+        [PreserveSig] int GetValue(ref PropertyKey k, out PropVariant v);
+        [PreserveSig] int SetValue(ref PropertyKey k, ref PropVariant v);
+        [PreserveSig] int Commit();
+    }
+    [ComImport, Guid("0000010b-0000-0000-C000-000000000046"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPersistFile {
+        [PreserveSig] int GetClassID(out Guid classID);
+        [PreserveSig] int IsDirty();
+        [PreserveSig] int Load([MarshalAs(UnmanagedType.LPWStr)] string path, uint mode);
+        [PreserveSig] int Save([MarshalAs(UnmanagedType.LPWStr)] string path,
+                               [MarshalAs(UnmanagedType.Bool)] bool remember);
+        [PreserveSig] int SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string path);
+        [PreserveSig] int GetCurFile(out IntPtr ppszFileName);
+    }
+    [StructLayout(LayoutKind.Sequential, Pack=4)]
+    struct PropertyKey { public Guid fmtid; public uint pid; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct PropVariant {
+        public ushort vt; ushort r1, r2, r3;
+        public IntPtr p; IntPtr p2;
+    }
+    static PropertyKey PKEY = new PropertyKey {
+        fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5
+    };
+    public static string Get(string lnkPath) {
+        object link = new ShellLink();
+        try {
+            ((IPersistFile)link).Load(lnkPath, 0);
+            PropVariant val;
+            ((IPropertyStore)link).GetValue(ref PKEY, out val);
+            if (val.vt == 31 && val.p != IntPtr.Zero) {
+                string s = Marshal.PtrToStringUni(val.p);
+                Marshal.FreeCoTaskMem(val.p);
+                return s;
+            }
+        } finally { Marshal.ReleaseComObject(link); }
+        return null;
+    }
+    public static void Set(string lnkPath, string aumid) {
+        object link = new ShellLink();
+        try {
+            ((IPersistFile)link).Load(lnkPath, 0);
+            var store = (IPropertyStore)link;
+            var val = new PropVariant { vt = 31, p = Marshal.StringToCoTaskMemUni(aumid) };
+            store.SetValue(ref PKEY, ref val);
+            store.Commit();
+            ((IPersistFile)link).Save(lnkPath, true);
+            Marshal.FreeCoTaskMem(val.p);
+        } finally { Marshal.ReleaseComObject(link); }
+    }
+}
+'@
+$id = $null
+$progs = [Environment]::GetFolderPath('Programs')
+foreach ($rel in @('Discord Phoenix.lnk','Discord Phoenix\Discord Phoenix.lnk')) {
+    $dp = Join-Path $progs $rel
+    if (Test-Path $dp) { $id = [LnkAumid]::Get($dp); if ($id) { break } }
+}
+if (-not $id) { $id = $env:EMBER_AUMID_FALLBACK }
+if ($id) {
+    $dirs = @($progs)
+    if ($env:EMBER_AUMID_DESKTOP -eq '1') { $dirs += [Environment]::GetFolderPath('Desktop') }
+    foreach ($dir in $dirs) {
+        $p = Join-Path $dir 'Ember.lnk'
+        if (Test-Path $p) { [LnkAumid]::Set($p, $id) }
+    }
+}
+} catch {}"#;
 
 /// Launch the installed ember-launcher.exe (detects installed location -> inject).
 pub fn launch_installed() -> Result<()> {
@@ -192,14 +256,8 @@ pub fn launch_installed() -> Result<()> {
 // ── Headless install / uninstall ────────────────────────────────────────
 
 pub fn headless_install() -> Result<()> {
-    let pin_failed = do_install(&InstallOptions::default())?;
-    let msg = if pin_failed {
-        "Ember installed. Taskbar pinning is not available on this \
-         Windows version -- drag the Ember shortcut to the taskbar manually."
-    } else {
-        "Ember installed successfully."
-    };
-    super::info(msg);
+    do_install(&InstallOptions::default())?;
+    super::info("Ember installed successfully.");
     Ok(())
 }
 

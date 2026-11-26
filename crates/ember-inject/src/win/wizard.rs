@@ -59,12 +59,8 @@ pub struct Wizard {
         size: (460, 30), position: (20, 20), font: Some(&data.font_title))]
     p4_title: nwg::Label,
 
-    #[nwg_control(parent: window, text: "Pin to taskbar (recommended)",
-        size: (400, 25), position: (20, 70))]
-    p4_taskbar: nwg::CheckBox,
-
     #[nwg_control(parent: window, text: "Add to desktop (recommended)",
-        size: (400, 25), position: (20, 105))]
+        size: (400, 25), position: (20, 70))]
     p4_desktop: nwg::CheckBox,
 
     // ── Page 5: Installing ──────────────────────────────────────────────
@@ -84,18 +80,13 @@ pub struct Wizard {
     p6_title: nwg::Label,
 
     #[nwg_control(parent: window,
-        text: "Ember is installed. Open Discord from the Ember icon.",
-        size: (460, 100), position: (20, 60))]
+        text: "Ember is installed. Open Discord from the Ember icon.\r\n\r\nTip: pin the Ember shortcut from your Start Menu to the taskbar.",
+        size: (460, 120), position: (20, 60))]
     p6_text: nwg::Label,
 
     #[nwg_control(parent: window, text: "Launch Ember now",
-        size: (300, 25), position: (20, 165))]
+        size: (300, 25), position: (20, 185))]
     p6_launch: nwg::CheckBox,
-
-    #[nwg_control(parent: window,
-        text: "Tip: drag the Ember shortcut from your Start Menu to the taskbar to pin it.",
-        size: (460, 40), position: (20, 200))]
-    p6_pin_note: nwg::Label,
 
     // ── Navigation ──────────────────────────────────────────────────────
 
@@ -120,7 +111,6 @@ pub struct Wizard {
     // ── State ───────────────────────────────────────────────────────────
 
     page: Cell<usize>,
-    pin_failed: Cell<bool>,
 }
 
 impl Wizard {
@@ -166,14 +156,10 @@ impl Wizard {
     fn on_install_tick(&self) {
         self.install_timer.stop();
         let opts = super::install::InstallOptions {
-            pin_taskbar: self.p4_taskbar.check_state() == nwg::CheckBoxState::Checked,
             add_desktop: self.p4_desktop.check_state() == nwg::CheckBoxState::Checked,
         };
         match super::install::do_install(&opts) {
-            Ok(pin_failed) => {
-                self.pin_failed.set(pin_failed);
-                self.show_page(6);
-            }
+            Ok(()) => self.show_page(6),
             Err(e) => {
                 super::alert(&format!("Install failed: {e}"));
                 self.show_page(4);
@@ -220,7 +206,6 @@ impl Wizard {
             }
             4 => {
                 self.p4_title.set_visible(true);
-                self.p4_taskbar.set_visible(true);
                 self.p4_desktop.set_visible(true);
                 self.back_btn.set_visible(true);
                 self.next_btn.set_visible(true);
@@ -239,9 +224,6 @@ impl Wizard {
                 self.p6_title.set_visible(true);
                 self.p6_text.set_visible(true);
                 self.p6_launch.set_visible(true);
-                if self.pin_failed.get() {
-                    self.p6_pin_note.set_visible(true);
-                }
                 self.back_btn.set_visible(false);
                 self.next_btn.set_visible(true);
                 self.next_btn.set_text("Finish");
@@ -261,14 +243,12 @@ impl Wizard {
         self.p3_text.set_visible(false);
         self.p3_agree.set_visible(false);
         self.p4_title.set_visible(false);
-        self.p4_taskbar.set_visible(false);
         self.p4_desktop.set_visible(false);
         self.p5_title.set_visible(false);
         self.p5_text.set_visible(false);
         self.p6_title.set_visible(false);
         self.p6_text.set_visible(false);
         self.p6_launch.set_visible(false);
-        self.p6_pin_note.set_visible(false);
     }
 }
 
@@ -287,8 +267,6 @@ pub fn show() -> super::Result<()> {
 
     // Set initial checkbox states (done after build so we avoid derive-macro
     // enum-resolution issues with CheckBoxState in attributes).
-    app.p4_taskbar
-        .set_check_state(nwg::CheckBoxState::Checked);
     app.p4_desktop
         .set_check_state(nwg::CheckBoxState::Checked);
     app.p6_launch

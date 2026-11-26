@@ -383,22 +383,19 @@ mod tests {
 
     #[test]
     fn options_to_actions() {
-        let opts = install::InstallOptions {
-            pin_taskbar: true,
-            add_desktop: true,
-        };
+        let opts = install::InstallOptions { add_desktop: true };
         let actions = install::actions_from_options(&opts);
         assert!(actions.create_start_menu);
         assert!(actions.create_desktop);
-        assert!(actions.attempt_pin);
 
-        let opts = install::InstallOptions {
-            pin_taskbar: false,
-            add_desktop: false,
-        };
+        let opts = install::InstallOptions { add_desktop: false };
         let actions = install::actions_from_options(&opts);
         assert!(actions.create_start_menu);
         assert!(!actions.create_desktop);
-        assert!(!actions.attempt_pin);
+    }
+
+    #[test]
+    fn aumid_fallback_is_set() {
+        assert!(!install::DISCORD_AUMID_FALLBACK.is_empty());
     }
 }
