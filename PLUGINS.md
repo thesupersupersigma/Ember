@@ -76,7 +76,7 @@ overlap Vencord but aren't direct matches.
 | BlurNSFW | | Blur Amount (in pixels) | UI patch |
 | CallTimer | | The timer format. This can be any valid moment.js format | UI patch |
 | CharacterCounter | | Enable yellow/red colouring as you get closer to the character limit | UI patch |
-| ClearURLs | | Automatically removes tracking elements from URLs you send | request |
+| ClearURLs | ✅ Ported | Automatically removes tracking elements from URLs you send | request |
 | ClientTheme | | Recreation of the old client theme experiment. Add a color to your Discord client theme | settings-only |
 | ColorSighted | | Removes the colorblind-friendly icons from statuses, just like 2015-2017 Discord | UI patch |
 | ConsoleJanitor | | Disables Discords loggers | UI patch |
@@ -173,7 +173,7 @@ overlap Vencord but aren't direct matches.
 | ReviewDB | | Review other users (Adds a new settings to profiles) | UI patch |
 | RoleColorEverywhere | | Show role colors in chat mentions (including in the message box) | UI patch |
 | SecretRingToneEnabler | | Only play the Snow Halation Theme | UI patch |
-| SendTimestamps | | Replace timestamps in message contents | request |
+| SendTimestamps | ✅ Ported | Replace timestamps in message contents | request |
 | ServerInfo | | Allows you to view info about a server | context-menu |
 | ServerListIndicators | | Mode | settings-only |
 | ShikiCodeblocks | | Brings vscode-style codeblocks into Discord, powered by Shiki | UI patch |
@@ -193,12 +193,12 @@ overlap Vencord but aren't direct matches.
 | StickerPaste | | Makes picking a sticker in the sticker picker insert it into the chatbox instead of instantl... | UI patch |
 | StreamerModeOnStream | | Automatically enables streamer mode when you start streaming in Discord | gateway |
 | SuperReactionTweaks | | Reaction picker will default to Super Reactions | UI patch |
-| TextReplace | | Rules for replacing text using string matching. | UI patch |
+| TextReplace | ✅ Ported | Rules for replacing text using string matching. | UI patch |
 | ThemeAttributes | | Adds data attributes to various elements for theming purposes | UI patch |
 | Translate | | Translate messages with Google Translate, DeepL or Kagi. | request |
 | TypingIndicator | | Whether to show the typing indicator for the currently selected channel | UI patch |
 | TypingTweaks | | Show avatars in the typing indicator | UI patch |
-| Unindent | | Trims leading indentation from codeblocks | UI patch |
+| Unindent | ✅ Ported | Trims leading indentation from codeblocks | UI patch |
 | UnlockedAvatarZoom | | Zoom multiplier | UI patch |
 | UnsuppressEmbeds | | Allows you to unsuppress embeds in messages | context-menu |
 | UserMessagesPronouns | | Adds pronouns to chat user messages | UI patch |
