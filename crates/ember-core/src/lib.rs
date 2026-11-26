@@ -31,9 +31,26 @@ use windows_sys::Win32::System::Memory::{
     VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
 };
 use windows_sys::Win32::System::ProcessStatus::{GetModuleInformation, MODULEINFO};
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
-use windows_sys::Win32::System::Threading::{CreateThread, GetCurrentProcess, Sleep};
+use windows_sys::Win32::System::Threading::{
+    CreateThread, GetCurrentProcess, GetCurrentProcessId, Sleep,
+};
 use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+// Not exported by the Win32_UI_Shell feature in windows-sys 0.59.
+#[link(name = "shell32")]
+extern "system" {
+    fn SHGetPropertyStoreForWindow(
+        hwnd: *mut c_void,
+        riid: *const windows_sys::core::GUID,
+        ppv: *mut *mut c_void,
+    ) -> i32;
+}
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    GWL_STYLE,
+};
 
 // v1 unlock (revised after the first live run): Phoenix has TWO access checks.
 // Gate A (task 01: guard +0x58d4c47 -> decision +0x52447c9) shows the screen
@@ -96,7 +113,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     // Set process AUMID before Discord's window is created (taskbar grouping).
     set_process_aumid();
 
-    match apply_unlock() {
+    let rc = match apply_unlock() {
         Ok(site) => {
             log(&format!("ember: gate patched at {site:p}"));
             // Anti-tamper re-read (task 03a mitigation).
@@ -124,7 +141,11 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
             log(&format!("ember: unlock failed: {e}"));
             1
         }
-    }
+    };
+
+    // Set AUMID on Discord's window via property store (timing-proof).
+    set_window_aumid();
+    rc
 }
 
 /// Find the gate guard in the main module's memory and patch its branch.
@@ -425,6 +446,169 @@ unsafe fn ascii_eq(ptr: *const u8, name: &[u8]) -> bool {
         }
     }
     unsafe { *ptr.add(name.len()) == 0 }
+}
+
+// ── AUMID: window property store (timing-proof) ──────────────────────
+
+/// Polling interval when waiting for Discord's main window (ms).
+const WINDOW_POLL_MS: u32 = 500;
+/// Maximum time to wait for the window (ms).
+const WINDOW_TIMEOUT_MS: u32 = 20_000;
+
+/// IID_IPropertyStore = {886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}
+const IID_IPROPERTY_STORE: windows_sys::core::GUID = windows_sys::core::GUID {
+    data1: 0x886D8EEB,
+    data2: 0x8CF2,
+    data3: 0x4446,
+    data4: [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99],
+};
+
+/// PKEY_AppUserModel_ID: fmtid {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, pid 5.
+#[repr(C)]
+struct PropertyKey {
+    fmtid: windows_sys::core::GUID,
+    pid: u32,
+}
+
+const PKEY_APPUSERMODEL_ID: PropertyKey = PropertyKey {
+    fmtid: windows_sys::core::GUID {
+        data1: 0x9F4C2855,
+        data2: 0x9F79,
+        data3: 0x4B39,
+        data4: [0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3],
+    },
+    pid: 5,
+};
+
+/// PROPVARIANT layout for VT_LPWSTR on x86-64 (24 bytes).
+#[repr(C)]
+struct PropVariantLpwstr {
+    vt: u16,              // VT_LPWSTR = 31
+    _reserved: [u16; 3],
+    pwsz: *const u16,
+    _pad: usize,
+}
+
+/// Set Ember's AUMID on Discord's main window via its IPropertyStore.
+/// This works on an already-created window, unlike
+/// `SetCurrentProcessExplicitAppUserModelID` which only affects future windows.
+/// Belt-and-suspenders: the process-level AUMID + IAT hook are kept above.
+fn set_window_aumid() {
+    // SAFETY: all COM/shell calls are fail-safe; errors are logged, not fatal.
+    unsafe {
+        let hr = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        // S_OK (0) or S_FALSE (1) are both fine; RPC_E_CHANGED_MODE means
+        // another COM mode was already set, which also works for our call.
+        if hr < 0 && hr != -2147417850 /* RPC_E_CHANGED_MODE */ {
+            log(&format!("ember: window AUMID skipped (CoInitializeEx = 0x{hr:08x})"));
+            return;
+        }
+        let need_uninit = hr >= 0; // only uninitialise if we successfully inited
+
+        let hwnd = poll_for_main_window();
+        if hwnd.is_null() {
+            log("ember: window AUMID skipped (window not found within timeout)");
+            if need_uninit { CoUninitialize(); }
+            return;
+        }
+
+        let mut store: *mut c_void = std::ptr::null_mut();
+        let hr = SHGetPropertyStoreForWindow(hwnd, &IID_IPROPERTY_STORE, &mut store);
+        if hr != 0 || store.is_null() {
+            log(&format!(
+                "ember: window AUMID skipped (SHGetPropertyStoreForWindow = 0x{hr:08x})"
+            ));
+            if need_uninit { CoUninitialize(); }
+            return;
+        }
+
+        let wide: Vec<u16> = EMBER_AUMID.encode_utf16().chain(std::iter::once(0)).collect();
+        let pv = PropVariantLpwstr {
+            vt: 31, // VT_LPWSTR
+            _reserved: [0; 3],
+            pwsz: wide.as_ptr(),
+            _pad: 0,
+        };
+
+        // IPropertyStore vtable:
+        // [0] QueryInterface [1] AddRef [2] Release
+        // [3] GetCount [4] GetAt [5] GetValue [6] SetValue [7] Commit
+        let vtable = *(store as *const *const usize);
+
+        let set_value: unsafe extern "system" fn(
+            *mut c_void,
+            *const PropertyKey,
+            *const PropVariantLpwstr,
+        ) -> i32 = std::mem::transmute(*vtable.add(6));
+        let hr = set_value(store, &PKEY_APPUSERMODEL_ID, &pv);
+
+        if hr == 0 {
+            let commit: unsafe extern "system" fn(*mut c_void) -> i32 =
+                std::mem::transmute(*vtable.add(7));
+            commit(store);
+            log("ember: window AUMID set");
+        } else {
+            log(&format!("ember: window AUMID skipped (SetValue = 0x{hr:08x})"));
+        }
+
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+            std::mem::transmute(*vtable.add(2));
+        release(store);
+
+        if need_uninit { CoUninitialize(); }
+    }
+}
+
+/// Poll for up to `WINDOW_TIMEOUT_MS` for Discord's main top-level window.
+fn poll_for_main_window() -> *mut c_void {
+    let pid = unsafe { GetCurrentProcessId() };
+    let mut elapsed = 0u32;
+    while elapsed < WINDOW_TIMEOUT_MS {
+        let hwnd = find_main_window(pid);
+        if !hwnd.is_null() {
+            return hwnd;
+        }
+        unsafe { Sleep(WINDOW_POLL_MS) };
+        elapsed += WINDOW_POLL_MS;
+    }
+    std::ptr::null_mut()
+}
+
+/// Find the best candidate main window for `pid`: visible, titled,
+/// preferring `WS_OVERLAPPEDWINDOW` style.
+fn find_main_window(pid: u32) -> *mut c_void {
+    struct Ctx {
+        pid: u32,
+        best: *mut c_void,
+        best_has_overlapped: bool,
+    }
+
+    unsafe extern "system" fn cb(hwnd: *mut c_void, lparam: isize) -> i32 {
+        unsafe {
+            let ctx = &mut *(lparam as *mut Ctx);
+            let mut wpid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut wpid);
+            if wpid != ctx.pid || IsWindowVisible(hwnd) == 0 {
+                return 1;
+            }
+            let mut title = [0u16; 2];
+            if GetWindowTextW(hwnd, title.as_mut_ptr(), 2) == 0 {
+                return 1; // skip untitled windows (tooltips, helpers)
+            }
+            const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            let overlapped = (style & WS_OVERLAPPEDWINDOW) == WS_OVERLAPPEDWINDOW;
+            if overlapped && !ctx.best_has_overlapped || ctx.best.is_null() {
+                ctx.best = hwnd;
+                ctx.best_has_overlapped = overlapped;
+            }
+            1
+        }
+    }
+
+    let mut ctx = Ctx { pid, best: std::ptr::null_mut(), best_has_overlapped: false };
+    unsafe { EnumWindows(Some(cb), &mut ctx as *mut Ctx as isize) };
+    ctx.best
 }
 
 // ── Logging ────────────────────────────────────────────────────────────
