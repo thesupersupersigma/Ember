@@ -33,28 +33,32 @@ use windows_sys::Win32::System::ProcessStatus::{GetModuleInformation, MODULEINFO
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_sys::Win32::System::Threading::{CreateThread, GetCurrentProcess, Sleep};
 
-/// Task 01 signature. The guard prologue; the patch site is `match + PATCH_OFFSET`.
-/// `56 48 83 EC 20 48 89 CE E8 ?? ?? ?? ?? 84 C0 74 06 ...`
-const GATE_SIG: &str =
-    "56 48 83 EC 20 48 89 CE E8 ?? ?? ?? ?? 84 C0 74 06 48 83 C4 20 5E C3 \
-     48 8D 15 ?? ?? ?? ?? 48 89 F1 48 83 C4 20 5E E9 ?? ?? ?? ??";
+// v1 unlock (revised after the first live run): Phoenix has TWO access checks.
+// Gate A (task 01: guard +0x58d4c47 -> decision +0x52447c9) shows the screen
+// BEFORE load. Gate B (decision fn +0x49b47fb, TWO callers) re-checks AFTER load
+// and bounced us back. Patching one guard branch only beat Gate A (homepage
+// flashed, then Gate B closed it). The robust fix — confirmed against Sunbird's
+// reference — is to patch the DECISION FUNCTION itself so every caller sees
+// "allowed", and the allowed value is 2 (downstream does `cmp al, 2`), not 1.
+//
+// We anchor on the UNIQUE caller site (distinctive `...03; jne; call; cmp al,2;
+// setne; ...`), then follow its rel32 call to the decision function and patch its
+// first 3 bytes to `mov al,2 ; ret`.
 
-/// Offset from the match start to the 4 bytes we rewrite (`84 C0 74 06`).
-const PATCH_OFFSET: usize = 0x0D;
+/// Unique caller of the access decision. The `call` (E8) is at CALL_OFFSET.
+const CALLER_SIG: &str =
+    "83 79 ?? 03 75 0C E8 ?? ?? ?? ?? 3C 02 0F 95 C0 EB 02 31 C0";
 
-/// Offset from the match start to the `lea rdx,[rip+disp]` that loads the gate
-/// screen builder's address. Used to disambiguate the 3 twin matches.
-const LEA_OFFSET: usize = 0x17;
+/// Offset of the `E8 rel32` call to the decision fn within CALLER_SIG.
+const CALL_OFFSET: usize = 0x06;
 
-/// RVA of the gate SCREEN BUILDER (task 01). The real guard is the signature
-/// match whose internal lea targets this. Build-specific but only used as a
-/// relative disambiguator among matches, not as a patch address.
-const BUILDER_RVA: usize = 0x595B3C0;
+/// Bytes we expect the decision fn to START with (`push rbp; push rsi; push rdi`).
+/// We refuse to patch if the prologue doesn't match.
+const DECISION_PROLOGUE: [u8; 3] = [0x55, 0x56, 0x57];
 
-/// Expected original bytes at the patch site — we refuse to patch anything else.
-const EXPECTED: [u8; 4] = [0x84, 0xC0, 0x74, 0x06];
-/// The replacement: `mov al,1 ; nop ; nop`.
-const REPLACEMENT: [u8; 4] = [0xB0, 0x01, 0x90, 0x90];
+/// The replacement written over the decision fn's start: `mov al, 2 ; ret`.
+/// `al == 2` is the value Phoenix's downstream `cmp al, 2` treats as allowed.
+const REPLACEMENT: [u8; 3] = [0xB0, 0x02, 0xC3];
 
 /// How long to wait before the anti-tamper re-read check (ms).
 const RECHECK_AFTER_MS: u32 = 5_000;
@@ -117,53 +121,43 @@ fn apply_unlock() -> Result<*mut u8, String> {
         let (text_off, text_len) = text_section(base, size)?;
         let text = std::slice::from_raw_parts(base.add(text_off), text_len);
 
-        let pat = Pattern::parse(GATE_SIG).map_err(|e| format!("bad signature: {e}"))?;
+        let pat = Pattern::parse(CALLER_SIG).map_err(|e| format!("bad signature: {e}"))?;
         let matches = pat.find_all(text);
         if matches.is_empty() {
-            return Err("gate signature not found — build may differ from 0.1.0.2208".into());
+            return Err("access-gate caller signature not found — build may differ \
+                        from 0.1.0.2208"
+                .into());
         }
-
-        // The prologue signature is NOT unique (3 twins in 0.1.0.2208). The real
-        // gate guard is the one whose internal `lea rdx,[rip+disp]` at +LEA_OFFSET
-        // points at the gate SCREEN BUILDER. Disambiguate by that control-flow fact
-        // instead of a fragile absolute address.
-        let mut chosen: Option<usize> = None;
-        for &hit in &matches {
-            // match RVA (in-memory) = text_off(=.text VA) + hit, since we scan the
-            // mapped image where section offset == RVA.
-            let match_rva = (text_off + hit) as isize;
-            let lea_rva = match_rva + LEA_OFFSET as isize;
-            // bytes at the lea: 48 8D 15 <disp32>
-            let lea = std::slice::from_raw_parts(base.add(text_off + hit + LEA_OFFSET), 7);
-            if lea[0] != 0x48 || lea[1] != 0x8D || lea[2] != 0x15 {
-                continue;
-            }
-            let disp = i32::from_le_bytes([lea[3], lea[4], lea[5], lea[6]]) as isize;
-            let target = lea_rva + 7 + disp;
-            if target == BUILDER_RVA as isize {
-                chosen = Some(hit);
-                break;
-            }
-        }
-        let hit = chosen.ok_or_else(|| {
-            format!(
-                "found {} signature match(es) but none point at the gate builder — build may differ from 0.1.0.2208",
-                matches.len()
-            )
-        })?;
-
-        let site = base.add(text_off + hit + PATCH_OFFSET) as *mut u8;
-        let current = std::slice::from_raw_parts(site, EXPECTED.len());
-        if current != EXPECTED {
+        if matches.len() > 1 {
+            // The caller sig is expected to be unique; if not, we don't guess.
             return Err(format!(
-                "patch site mismatch: expected {EXPECTED:02X?}, found {current:02X?}"
+                "access-gate caller signature matched {} times (expected 1)",
+                matches.len()
+            ));
+        }
+        let caller = matches[0];
+
+        // Follow the E8 rel32 call at CALL_OFFSET to the decision function.
+        // In the mapped image, section offset == RVA, so text starts at text_off.
+        let call_rva = (text_off + caller + CALL_OFFSET) as isize;
+        let rel_bytes = std::slice::from_raw_parts(base.add(text_off + caller + CALL_OFFSET + 1), 4);
+        let rel = i32::from_le_bytes([rel_bytes[0], rel_bytes[1], rel_bytes[2], rel_bytes[3]]) as isize;
+        // target = addr of next insn (call_rva + 5) + rel
+        let decision_rva = (call_rva + 5 + rel) as usize;
+
+        let site = base.add(decision_rva) as *mut u8;
+        let current = std::slice::from_raw_parts(site, DECISION_PROLOGUE.len());
+        if current != DECISION_PROLOGUE {
+            return Err(format!(
+                "decision prologue mismatch at RVA +0x{decision_rva:x}: expected \
+                 {DECISION_PROLOGUE:02X?}, found {current:02X?}"
             ));
         }
 
         log(&format!(
-            "ember: {} signature match(es); patching the one at RVA +0x{:x}",
-            matches.len(),
-            text_off + hit
+            "ember: caller @ RVA +0x{:x} -> decision fn RVA +0x{decision_rva:x}; \
+             patching mov al,2; ret",
+            text_off + caller
         ));
         write_code(site, &REPLACEMENT)?;
         Ok(site)

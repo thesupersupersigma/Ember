@@ -84,3 +84,22 @@ control-flow disambiguator, robust to the twins.
 Still to watch if it STILL fails after this fix: timing — our ~2 s .text scan may
 run after the guard already evaluated at startup. If so, the fix is to speed up
 the scan (ember-sig PERF skip-ahead) and/or hook earlier.
+
+## Second live run: homepage flashed then closed -> TWO gates (fixed)
+After the twin-disambiguation fix, Ember patched the real Gate A guard
+(+0x58d4c54) and the Discord homepage appeared for ~1 second, then the gate
+returned. Diagnosis (static, cross-checked against Sunbird's reference in
+ignored/refrences/sunbird):
+- Phoenix has TWO access checks. Gate A (task 01: guard +0x58d4c47 -> decision
+  +0x52447c9) shows the screen BEFORE load; we beat it. A SECOND gate re-checks
+  AFTER load and bounced us.
+- Sunbird patches a DIFFERENT function: decision fn +0x49b47fb, reached from a
+  UNIQUE caller (+0x49b7557). That decision fn has TWO callers, and downstream
+  does `cmp al, 2` — so the allowed value is **2**, not 1. Sunbird writes
+  `mov al,2; ret` (B0 02 C3) over the decision fn itself, covering every caller.
+- Our first patch (mov al,1 on a guard branch) couldn't satisfy `cmp al,2` and
+  only covered one path.
+Fix: ember-core now anchors on the unique CALLER_SIG
+`83 79 ?? 03 75 0C E8 ?? ?? ?? ?? 3C 02 0F 95 C0 EB 02 31 C0`, follows the E8
+call at +0x06 to the decision fn, verifies its prologue (55 56 57), and writes
+`mov al,2; ret`. This matches Sunbird's working approach, reimplemented ourselves.
