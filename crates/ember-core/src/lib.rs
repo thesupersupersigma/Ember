@@ -42,6 +42,15 @@ const GATE_SIG: &str =
 /// Offset from the match start to the 4 bytes we rewrite (`84 C0 74 06`).
 const PATCH_OFFSET: usize = 0x0D;
 
+/// Offset from the match start to the `lea rdx,[rip+disp]` that loads the gate
+/// screen builder's address. Used to disambiguate the 3 twin matches.
+const LEA_OFFSET: usize = 0x17;
+
+/// RVA of the gate SCREEN BUILDER (task 01). The real guard is the signature
+/// match whose internal lea targets this. Build-specific but only used as a
+/// relative disambiguator among matches, not as a patch address.
+const BUILDER_RVA: usize = 0x595B3C0;
+
 /// Expected original bytes at the patch site — we refuse to patch anything else.
 const EXPECTED: [u8; 4] = [0x84, 0xC0, 0x74, 0x06];
 /// The replacement: `mov al,1 ; nop ; nop`.
@@ -109,9 +118,39 @@ fn apply_unlock() -> Result<*mut u8, String> {
         let text = std::slice::from_raw_parts(base.add(text_off), text_len);
 
         let pat = Pattern::parse(GATE_SIG).map_err(|e| format!("bad signature: {e}"))?;
-        let hit = pat
-            .find(text)
-            .ok_or("gate signature not found — build may differ from 0.1.0.2208")?;
+        let matches = pat.find_all(text);
+        if matches.is_empty() {
+            return Err("gate signature not found — build may differ from 0.1.0.2208".into());
+        }
+
+        // The prologue signature is NOT unique (3 twins in 0.1.0.2208). The real
+        // gate guard is the one whose internal `lea rdx,[rip+disp]` at +LEA_OFFSET
+        // points at the gate SCREEN BUILDER. Disambiguate by that control-flow fact
+        // instead of a fragile absolute address.
+        let mut chosen: Option<usize> = None;
+        for &hit in &matches {
+            // match RVA (in-memory) = text_off(=.text VA) + hit, since we scan the
+            // mapped image where section offset == RVA.
+            let match_rva = (text_off + hit) as isize;
+            let lea_rva = match_rva + LEA_OFFSET as isize;
+            // bytes at the lea: 48 8D 15 <disp32>
+            let lea = std::slice::from_raw_parts(base.add(text_off + hit + LEA_OFFSET), 7);
+            if lea[0] != 0x48 || lea[1] != 0x8D || lea[2] != 0x15 {
+                continue;
+            }
+            let disp = i32::from_le_bytes([lea[3], lea[4], lea[5], lea[6]]) as isize;
+            let target = lea_rva + 7 + disp;
+            if target == BUILDER_RVA as isize {
+                chosen = Some(hit);
+                break;
+            }
+        }
+        let hit = chosen.ok_or_else(|| {
+            format!(
+                "found {} signature match(es) but none point at the gate builder — build may differ from 0.1.0.2208",
+                matches.len()
+            )
+        })?;
 
         let site = base.add(text_off + hit + PATCH_OFFSET) as *mut u8;
         let current = std::slice::from_raw_parts(site, EXPECTED.len());
@@ -121,6 +160,11 @@ fn apply_unlock() -> Result<*mut u8, String> {
             ));
         }
 
+        log(&format!(
+            "ember: {} signature match(es); patching the one at RVA +0x{:x}",
+            matches.len(),
+            text_off + hit
+        ));
         write_code(site, &REPLACEMENT)?;
         Ok(site)
     }

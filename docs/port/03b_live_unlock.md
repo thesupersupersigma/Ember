@@ -66,3 +66,21 @@ First `cargo build` failed with 2 hard errors + 32 warnings. Root causes:
   ember-core. Removed the unused `HANDLE` import there too.
 - `.pdb` collision warning (ember.exe + ember.dll both emit ember.pdb): added a
   release profile with `strip = "debuginfo"` (we don't ship pdbs for v1).
+
+## First live run (2026-11-26): FALSE success — wrong site patched
+Log said "gate patched ... patch still in place", but the gate still showed.
+Diagnosis (static analysis from chat, no IDA):
+- The task-01 prologue signature is NOT unique: it matches **3 twin functions**
+  in .text (RVA +0x4d9e612, +0x545c08a, +0x58d4c47). ember-sig's `find()` returns
+  the FIRST, which is the wrong function — so we patched an innocent lookalike and
+  the real gate guard was never touched. (All 3 have `84 C0 74 06` at +0x0D.)
+- The gate SCREEN BUILDER (+0x595b3c0) is referenced in exactly ONE place —
+  inside the real guard (the `lea rdx` at +0x17). There is no second code path to
+  the screen, so disambiguating the guard is sufficient.
+Fix: ember-core now uses `find_all`, then picks the match whose internal
+`lea rdx,[rip+disp]` at +0x17 targets the builder RVA (+0x595b3c0). Verified
+against the 3 candidates: only +0x58d4c47 points at the builder. This is a
+control-flow disambiguator, robust to the twins.
+Still to watch if it STILL fails after this fix: timing — our ~2 s .text scan may
+run after the guard already evaluated at startup. If so, the fix is to speed up
+the scan (ember-sig PERF skip-ahead) and/or hook earlier.
