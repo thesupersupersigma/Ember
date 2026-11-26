@@ -10,6 +10,9 @@ authors.workspace = true
 name = "ember-launcher"
 path = "src/main.rs"
 
+[build-dependencies]
+winres = "0.1"
+
 [lints]
 workspace = true
 
