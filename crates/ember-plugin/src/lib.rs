@@ -1,11 +1,15 @@
-//! `ember-plugin` — HTTP request hook and plugin API for Discord Phoenix.
+//! `ember-plugin` — HTTP request hook, gateway event hook and plugin API for
+//! Discord Phoenix.
 //!
-//! Locates Desktop Phoenix's `ReqwestTransport::send` by its unique anchor
-//! string, installs an inline hook, and dispatches outgoing requests through
-//! registered plugin filters.
+//! **HTTP hook**: locates Desktop Phoenix's `ReqwestTransport::send` by its
+//! unique anchor string, installs an inline hook, and dispatches outgoing
+//! requests through registered plugin filters.
 //!
-//! v1 ships one built-in plugin: **silent-typing** — drops
-//! `POST /channels/*/typing` so other users never see the typing indicator.
+//! **Gateway hook**: locates a domain event handler by byte-pattern signature,
+//! installs an inline hook, and dispatches incoming gateway events through
+//! registered event hooks. Privacy: the hook never logs event payloads, message
+//! content, tokens or user IDs — only the event name and whether a hook
+//! matched, behind a debug flag.
 //!
 //! # ABI assumptions (build 0.1.0.2208)
 //!
@@ -13,6 +17,10 @@
 //! layout observed by the sunbird reference against the same Phoenix desktop
 //! build. `Transport::send` uses Rust ABI; on Win64 with simple pointer args
 //! the lowering matches the platform convention.
+//!
+//! The gateway domain handler uses `(state, name_ptr, name_len, a4, a5, a6)`
+//! calling convention (Windows x64). The handler was identified via IDA
+//! analysis of the dispatch chain from the WebSocket message handler.
 
 #![cfg(windows)]
 #![allow(clippy::missing_safety_doc)]
@@ -82,6 +90,35 @@ pub struct RequestInfo<'a> {
     pub path: &'a str,
 }
 
+/// What a gateway event hook tells the dispatcher to do.
+pub enum EventAction {
+    /// Forward the event unchanged.
+    Pass,
+    /// Silently drop the event (Phoenix never processes it).
+    Drop,
+    /// Replace the event data before dispatch.
+    // shortcut: data layout unknown in v1; falls through to Pass, upgrade when
+    // the domain handler's data arguments are mapped.
+    Replace(Vec<u8>),
+}
+
+/// Filter for incoming gateway events — non-matching events skip the handler.
+pub struct EventFilter {
+    pub event_name: &'static str,
+}
+
+impl EventFilter {
+    /// Does `name` pass this filter? Comparison is case-insensitive.
+    pub fn matches(&self, name: &str) -> bool {
+        self.event_name.eq_ignore_ascii_case(name)
+    }
+}
+
+/// Read-only view of an intercepted gateway event.
+pub struct EventInfo<'a> {
+    pub name: &'a str,
+}
+
 /// Registration context handed to [`Plugin::register`].
 pub struct PluginCtx;
 
@@ -92,6 +129,17 @@ impl PluginCtx {
         F: Fn(&RequestInfo) -> RequestAction + Send + Sync + 'static,
     {
         hooks().lock().unwrap().push(RegisteredHook {
+            filter,
+            handler: Box::new(handler),
+        });
+    }
+
+    /// Register a gateway event hook that runs for every matching incoming event.
+    pub fn on_event<F>(&mut self, filter: EventFilter, handler: F)
+    where
+        F: Fn(&EventInfo) -> EventAction + Send + Sync + 'static,
+    {
+        event_hooks().lock().unwrap().push(RegisteredEventHook {
             filter,
             handler: Box::new(handler),
         });
@@ -118,6 +166,16 @@ struct RegisteredHook {
 fn hooks() -> &'static Mutex<Vec<RegisteredHook>> {
     static HOOKS: OnceLock<Mutex<Vec<RegisteredHook>>> = OnceLock::new();
     HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+struct RegisteredEventHook {
+    filter: EventFilter,
+    handler: Box<dyn Fn(&EventInfo) -> EventAction + Send + Sync>,
+}
+
+fn event_hooks() -> &'static Mutex<Vec<RegisteredEventHook>> {
+    static EVENT_HOOKS: OnceLock<Mutex<Vec<RegisteredEventHook>>> = OnceLock::new();
+    EVENT_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 // =========================================================================
@@ -172,6 +230,37 @@ const METHODS: [&str; 10] = [
 const ANCHOR: &[u8] = b"a host file body needs the host's transport";
 
 // =========================================================================
+// Gateway hook types (build 0.1.0.2208)
+// =========================================================================
+
+/// Domain handler: `fn(state, name_ptr, name_len, a4, a5, a6) -> i64`.
+/// The first three args carry the event name as a Rust `&str`-like (ptr + len).
+type GatewayHandlerFn = unsafe fn(
+    *const c_void,
+    *const u8,
+    usize,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+) -> i64;
+
+static GATEWAY_TRAMPOLINE: OnceLock<GatewayHandlerFn> = OnceLock::new();
+
+/// Byte-pattern signature for the domain handler that processes MESSAGE_CREATE,
+/// MESSAGE_ACK, CHANNEL_UNREAD_UPDATE, VOICE_STATE_UPDATE, CHANNEL_CREATE etc.
+///
+/// Prologue: push r14/rsi/rdi/rbx; sub rsp,48h; save four args to callee-saved
+/// regs; mov dword [rsp+44h], 42; lea rcx,[rip+<MESSAGE_CREATE...>]; lea r8,
+/// [rsp+44h]; mov edx, 14.
+const GATEWAY_SIG: &str = "\
+    41 56 56 57 53 48 83 EC 48 \
+    4C 89 CE 4C 89 C7 48 89 D3 49 89 CE \
+    C7 44 24 44 2A 00 00 00 \
+    48 8D 0D ?? ?? ?? ?? \
+    4C 8D 44 24 44 \
+    BA 0E 00 00 00";
+
+// =========================================================================
 // install()
 // =========================================================================
 
@@ -212,19 +301,26 @@ pub fn install() -> Result<(), String> {
              (anchor LEA at +0x{lea_rva:x})"
         ));
 
-        // 4. Install inline hook
-        let tramp = install_inline_hook(send_ptr, send_detour as *const ())?;
+        // 4. Install inline hook on Transport::send
+        let tramp_ptr = install_inline_hook(send_ptr, send_detour as *const ())?;
+        let tramp: SendFn = std::mem::transmute(tramp_ptr);
         TRAMPOLINE
             .set(tramp)
             .map_err(|_| "hook already installed (race)".to_string())?;
 
-        // 5. Register built-in plugins
+        // 5. Install gateway event hook (non-fatal — log and continue)
+        match install_gateway_hook(base, text, pdata) {
+            Ok(()) => log("ember-plugin: gateway event hook active"),
+            Err(e) => log(&format!("ember-plugin: gateway hook skipped: {e}")),
+        }
+
+        // 6. Register built-in plugins
         let mut ctx = PluginCtx;
         for plugin in plugins::builtins() {
             plugin.register(&mut ctx);
         }
 
-        log("ember-plugin: hooks installed, silent-typing active");
+        log("ember-plugin: hooks installed");
         Ok(())
     }
 }
@@ -285,6 +381,119 @@ fn run_hooks(method: &str, path: &str) -> RequestAction {
 }
 
 // =========================================================================
+// Gateway detour
+// =========================================================================
+
+/// Detour for the gateway domain handler. Receives the same six arguments as the
+/// original: `(state, event_name_ptr, event_name_len, a4, a5, a6)`.
+///
+/// Privacy: only the event NAME is read; payload data, message content, tokens
+/// and user IDs are never accessed or logged.
+unsafe fn gateway_detour(
+    state: *const c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    a4: *const c_void,
+    a5: *const c_void,
+    a6: *const c_void,
+) -> i64 {
+    let tramp = GATEWAY_TRAMPOLINE
+        .get()
+        .expect("gateway detour called before trampoline set");
+
+    let action = if !name_ptr.is_null() && (1..=64).contains(&name_len) {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let name_bytes = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+            if let Ok(name) = std::str::from_utf8(name_bytes) {
+                return run_event_hooks(name);
+            }
+            EventAction::Pass
+        }))
+        .unwrap_or(EventAction::Pass)
+    } else {
+        EventAction::Pass
+    };
+
+    match action {
+        EventAction::Pass | EventAction::Replace(_) => unsafe {
+            tramp(state, name_ptr, name_len, a4, a5, a6)
+        },
+        EventAction::Drop => 0, // 0 = "no match" — caller skips processing
+    }
+}
+
+fn run_event_hooks(name: &str) -> EventAction {
+    let Ok(hooks) = event_hooks().lock() else {
+        return EventAction::Pass;
+    };
+    let info = EventInfo { name };
+    for hook in hooks.iter() {
+        if hook.filter.matches(name) {
+            match (hook.handler)(&info) {
+                EventAction::Pass => continue,
+                action => {
+                    #[cfg(debug_assertions)]
+                    log(&format!("ember-plugin: event hook matched {name}"));
+                    return action;
+                }
+            }
+        }
+    }
+    EventAction::Pass
+}
+
+/// Locate the gateway domain handler by byte-pattern signature and install an
+/// inline hook. Non-fatal: the caller logs and continues if this fails.
+unsafe fn install_gateway_hook(
+    base: *const u8,
+    text: (usize, usize),
+    pdata: (usize, usize),
+) -> Result<(), String> {
+    if GATEWAY_TRAMPOLINE.get().is_some() {
+        return Ok(());
+    }
+
+    let sig = ember_sig::Pattern::parse(GATEWAY_SIG)
+        .map_err(|e| format!("bad gateway sig: {e}"))?;
+
+    let text_bytes = unsafe { std::slice::from_raw_parts(base.add(text.0), text.1) };
+    let matches = sig.find_all(text_bytes);
+    if matches.is_empty() {
+        return Err("gateway handler signature not found — build may differ".into());
+    }
+    if matches.len() > 1 {
+        return Err(format!(
+            "gateway handler sig matched {} times (expected 1)",
+            matches.len()
+        ));
+    }
+
+    let fn_rva = text.0 + matches[0];
+
+    // Verify the match sits at a function start via .pdata.
+    let (fn_begin, _) = pdata_lookup(base, pdata, fn_rva)?;
+    if fn_begin != fn_rva {
+        return Err(format!(
+            "gateway sig at +0x{fn_rva:x} but pdata function starts at +0x{fn_begin:x}"
+        ));
+    }
+
+    log(&format!(
+        "ember-plugin: gateway domain handler at RVA +0x{fn_rva:x}"
+    ));
+
+    let handler_ptr = unsafe { base.add(fn_rva) as *mut u8 };
+    let tramp_ptr =
+        unsafe { install_inline_hook(handler_ptr, gateway_detour as *const ()) }?;
+    let tramp: GatewayHandlerFn = unsafe { std::mem::transmute(tramp_ptr) };
+    GATEWAY_TRAMPOLINE
+        .set(tramp)
+        .map_err(|_| "gateway hook already installed (race)".to_string())?;
+
+    Ok(())
+}
+
+// =========================================================================
 // Reading request fields
 // =========================================================================
 
@@ -323,11 +532,12 @@ fn api_path(url: &str) -> Option<&str> {
 // =========================================================================
 
 /// Install a 14-byte absolute jump at `target` redirecting to `detour`.
-/// Returns a trampoline function pointer to the original code.
+/// Returns a raw trampoline pointer to the original code (caller transmutes
+/// to the correct function type).
 unsafe fn install_inline_hook(
     target: *mut u8,
     detour: *const (),
-) -> Result<SendFn, String> {
+) -> Result<*const (), String> {
     const JMP_LEN: usize = 14; // FF 25 00000000 + 8-byte addr
 
     // 1. Measure safe-to-relocate prologue (pushes, sub rsp, mov to stack)
@@ -371,7 +581,7 @@ unsafe fn install_inline_hook(
     log(&format!(
         "ember-plugin: inline hook installed ({prol} prologue bytes relocated)"
     ));
-    Ok(unsafe { std::mem::transmute(tramp) })
+    Ok(tramp as *const ())
 }
 
 /// Write `jmp qword ptr [rip+0]; dq target` — 14 bytes total.
@@ -419,6 +629,15 @@ fn safe_prologue_len(code: &[u8], min: usize) -> Result<usize, String> {
             0x48 if code.get(pos + 1..pos + 4) == Some(&[0x8D, 0x6C, 0x24]) => pos += 5,
             // lea rbp, [rsp+disp32]
             0x48 if code.get(pos + 1..pos + 4) == Some(&[0x8D, 0xAC, 0x24]) => pos += 8,
+            // REX + mov r64, r64 (reg-to-reg, no memory — safe to relocate)
+            0x48..=0x4F
+                if matches!(code.get(pos + 1), Some(&0x89) | Some(&0x8B))
+                    && code.get(pos + 2).is_some_and(|b| b & 0xC0 == 0xC0) =>
+            {
+                pos += 3;
+            }
+            // mov dword [rsp+disp8], imm32 (C7 44 24 xx + imm32)
+            0xC7 if code.get(pos + 1..pos + 3) == Some(&[0x44, 0x24]) => pos += 8,
             _ => break,
         }
     }
@@ -708,5 +927,55 @@ mod tests {
         assert_eq!(memfind(b"hello world", b"world"), Some(6));
         assert_eq!(memfind(b"hello", b"xyz"), None);
         assert_eq!(memfind(b"aaa", b"aa"), Some(0));
+    }
+
+    // ----- EventFilter / EventAction tests -----
+
+    #[test]
+    fn event_filter_exact_match() {
+        let f = EventFilter {
+            event_name: "MESSAGE_CREATE",
+        };
+        assert!(f.matches("MESSAGE_CREATE"));
+        assert!(f.matches("message_create"));
+        assert!(!f.matches("MESSAGE_DELETE"));
+        assert!(!f.matches("MESSAGE_CREAT"));
+    }
+
+    #[test]
+    fn event_action_drop_variant() {
+        let action: EventAction = EventAction::Drop;
+        assert!(matches!(action, EventAction::Drop));
+    }
+
+    #[test]
+    fn event_action_replace_fallthrough() {
+        // Replace falls through to Pass in v1 (data layout unknown).
+        let action = EventAction::Replace(vec![1, 2, 3]);
+        assert!(matches!(action, EventAction::Replace(_)));
+    }
+
+    // ----- safe_prologue_len with new patterns -----
+
+    #[test]
+    fn safe_prologue_reg_to_reg_mov() {
+        // push r14; push rsi; push rdi; push rbx; sub rsp,48h;
+        // mov rsi,r9; mov rdi,r8; mov rbx,rdx; mov r14,rcx;
+        // mov [rsp+44h],42
+        let code: &[u8] = &[
+            0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x48, // 9 bytes
+            0x4C, 0x89, 0xCE, // mov rsi, r9
+            0x4C, 0x89, 0xC7, // mov rdi, r8
+            0x48, 0x89, 0xD3, // mov rbx, rdx
+            0x49, 0x89, 0xCE, // mov r14, rcx
+            0xC7, 0x44, 0x24, 0x44, 0x2A, 0x00, 0x00, 0x00, // mov [rsp+44h], 42
+            0x48, 0x8D, 0x0D, // LEA (stops here)
+        ];
+        assert_eq!(safe_prologue_len(code, 14).unwrap(), 29);
+    }
+
+    #[test]
+    fn gateway_sig_parses() {
+        assert!(ember_sig::Pattern::parse(GATEWAY_SIG).is_ok());
     }
 }

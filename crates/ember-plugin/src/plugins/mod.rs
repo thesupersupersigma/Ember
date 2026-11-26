@@ -6,6 +6,7 @@
 //!   3. Add `Box::new(<name>::<Type>)` to [`builtins()`].
 //! That is the only shared file a new plugin touches.
 
+mod event_observer;
 mod silent_typing;
 
 use crate::Plugin;
@@ -13,5 +14,6 @@ use crate::Plugin;
 pub fn builtins() -> Vec<Box<dyn Plugin>> {
     vec![
         Box::new(silent_typing::SilentTyping),
+        Box::new(event_observer::EventObserver),
     ]
 }
