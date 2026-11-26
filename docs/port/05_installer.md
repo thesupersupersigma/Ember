@@ -29,18 +29,12 @@ wizard at any time.
      - `Description` = `Discord (Ember)`
    - Paths reach the PowerShell script through environment variables, never
      interpolated into the script text.
-3. Sets `System.AppUserModel.ID` on each Ember shortcut to match Discord
-   Phoenix's AppUserModelID, so Windows groups Ember's shortcut and Discord's
-   running window into one taskbar button. The AUMID is read from Discord
-   Phoenix's own Start Menu shortcut at install time; if that fails, a
-   Squirrel-convention fallback (`com.squirrel.DiscordPhoenix.Discord`) is
-   used. This step is best-effort -- if it fails, shortcuts still work but may
+3. Sets `System.AppUserModel.ID` on each Ember shortcut to Ember's own
+   AUMID (`com.thesupersupersigma.ember`), so Windows groups the shortcut
+   and the running window into one taskbar button. The DLL side sets the
+   same value on the running process (see `docs/port/12_taskbar_icon.md`).
+   This step is best-effort -- if it fails, shortcuts still work but may
    show a separate taskbar icon.
-   **Reliability**: the AUMID must match what Discord's Electron process sets
-   at runtime via `app.setAppUserModelId`. If Discord changes its AUMID in a
-   future update, the fallback constant `DISCORD_AUMID_FALLBACK` in
-   `install.rs` needs updating. Discovery from Discord's shortcut adapts
-   automatically as long as that shortcut exists.
 4. The install is idempotent: re-running it updates the copied files and
    overwrites the existing shortcuts (no duplicates).
 

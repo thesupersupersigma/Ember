@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn aumid_fallback_is_set() {
-        assert!(!install::DISCORD_AUMID_FALLBACK.is_empty());
+    fn ember_aumid_matches_expected() {
+        assert_eq!(install::EMBER_AUMID, "com.thesupersupersigma.ember");
     }
 }

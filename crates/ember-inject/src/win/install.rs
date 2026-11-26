@@ -142,21 +142,19 @@ fn create_shortcuts(launcher: &Path, local_appdata: &Path, desktop: bool) -> Res
     Ok(())
 }
 
-/// AppUserModelID fallback; follows Squirrel convention com.squirrel.<AppDir>.<Exe>.
-/// shortcut: may drift if Discord changes its AUMID; discovery reads theirs first
-pub const DISCORD_AUMID_FALLBACK: &str = "com.squirrel.DiscordPhoenix.Discord";
+/// Ember's AppUserModelID — must match the value ember.dll sets on the process.
+pub const EMBER_AUMID: &str = "com.thesupersupersigma.ember";
 
-/// Best-effort: set AppUserModelID on Ember shortcuts so Windows groups them
-/// with Discord's window on the taskbar.  Uses COM `IPropertyStore` via a
-/// small C# helper compiled by `Add-Type`.  Discovers Discord Phoenix's AUMID
-/// from its own Start Menu shortcut; falls back to `DISCORD_AUMID_FALLBACK`.
+/// Best-effort: set `System.AppUserModel.ID` on Ember shortcuts so Windows
+/// groups the pinned shortcut and the running window into one taskbar button.
+/// Uses COM `IPropertyStore` via a small C# helper compiled by `Add-Type`.
 fn set_shortcut_aumid(desktop: bool) {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
     let _ = Command::new(super::powershell_path())
         .args(["-NoProfile", "-NonInteractive", "-Command", AUMID_SCRIPT])
-        .env("EMBER_AUMID_FALLBACK", DISCORD_AUMID_FALLBACK)
+        .env("EMBER_AUMID", EMBER_AUMID)
         .env("EMBER_AUMID_DESKTOP", if desktop { "1" } else { "0" })
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .status();
@@ -198,20 +196,6 @@ public class LnkAumid {
     static PropertyKey PKEY = new PropertyKey {
         fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5
     };
-    public static string Get(string lnkPath) {
-        object link = new ShellLink();
-        try {
-            ((IPersistFile)link).Load(lnkPath, 0);
-            PropVariant val;
-            ((IPropertyStore)link).GetValue(ref PKEY, out val);
-            if (val.vt == 31 && val.p != IntPtr.Zero) {
-                string s = Marshal.PtrToStringUni(val.p);
-                Marshal.FreeCoTaskMem(val.p);
-                return s;
-            }
-        } finally { Marshal.ReleaseComObject(link); }
-        return null;
-    }
     public static void Set(string lnkPath, string aumid) {
         object link = new ShellLink();
         try {
@@ -226,20 +210,11 @@ public class LnkAumid {
     }
 }
 '@
-$id = $null
-$progs = [Environment]::GetFolderPath('Programs')
-foreach ($rel in @('Discord Phoenix.lnk','Discord Phoenix\Discord Phoenix.lnk')) {
-    $dp = Join-Path $progs $rel
-    if (Test-Path $dp) { $id = [LnkAumid]::Get($dp); if ($id) { break } }
-}
-if (-not $id) { $id = $env:EMBER_AUMID_FALLBACK }
-if ($id) {
-    $dirs = @($progs)
-    if ($env:EMBER_AUMID_DESKTOP -eq '1') { $dirs += [Environment]::GetFolderPath('Desktop') }
-    foreach ($dir in $dirs) {
-        $p = Join-Path $dir 'Ember.lnk'
-        if (Test-Path $p) { [LnkAumid]::Set($p, $id) }
-    }
+$dirs = @([Environment]::GetFolderPath('Programs'))
+if ($env:EMBER_AUMID_DESKTOP -eq '1') { $dirs += [Environment]::GetFolderPath('Desktop') }
+foreach ($dir in $dirs) {
+    $p = Join-Path $dir 'Ember.lnk'
+    if (Test-Path $p) { [LnkAumid]::Set($p, $env:EMBER_AUMID) }
 }
 } catch {}"#;
 

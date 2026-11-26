@@ -21,6 +21,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use ember_sig::Pattern;
 use windows_sys::Win32::Foundation::HMODULE;
@@ -32,6 +33,7 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::ProcessStatus::{GetModuleInformation, MODULEINFO};
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_sys::Win32::System::Threading::{CreateThread, GetCurrentProcess, Sleep};
+use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
 // v1 unlock (revised after the first live run): Phoenix has TWO access checks.
 // Gate A (task 01: guard +0x58d4c47 -> decision +0x52447c9) shows the screen
@@ -63,6 +65,13 @@ const REPLACEMENT: [u8; 3] = [0xB0, 0x02, 0xC3];
 /// How long to wait before the anti-tamper re-read check (ms).
 const RECHECK_AFTER_MS: u32 = 5_000;
 
+/// The AUMID Ember owns — the installer sets this on shortcuts and this DLL
+/// sets it on the running process.  Both sides must use the same literal.
+const EMBER_AUMID: &str = "com.thesupersupersigma.ember";
+
+/// Original `SetCurrentProcessExplicitAppUserModelID` pointer saved from the IAT.
+static REAL_SET_AUMID: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
 /// DLL entry point. On attach we spin up a worker thread and return immediately —
 /// no heavy work inside loader lock.
 #[no_mangle]
@@ -84,6 +93,9 @@ pub extern "system" fn DllMain(_dll: HMODULE, reason: u32, _reserved: *mut c_voi
 }
 
 extern "system" fn worker(_param: *mut c_void) -> u32 {
+    // Set process AUMID before Discord's window is created (taskbar grouping).
+    set_process_aumid();
+
     match apply_unlock() {
         Ok(site) => {
             log(&format!("ember: gate patched at {site:p}"));
@@ -265,6 +277,157 @@ unsafe fn text_section(base: *const u8, size: usize) -> Result<(usize, usize), S
         Ok((0, size))
     }
 }
+
+// ── AUMID: process identity for taskbar grouping ───────────────────────
+
+/// Set the process AUMID to Ember's own value.  Two-pronged:
+///  1. IAT hook so Discord's own `SetCurrentProcessExplicitAppUserModelID`
+///     call uses our AUMID instead of its own.
+///  2. Direct call to cover the race where Discord already called before the
+///     hook was installed.
+/// Fail-safe: errors are logged, never fatal.
+fn set_process_aumid() {
+    let hook_result = unsafe { hook_iat_set_aumid() };
+    match hook_result {
+        Ok(()) => log("ember: AUMID IAT hook installed"),
+        Err(e) => log(&format!("ember: AUMID IAT hook skipped ({e})")),
+    }
+    let wide: Vec<u16> = EMBER_AUMID.encode_utf16().chain(std::iter::once(0)).collect();
+    let hr = unsafe { SetCurrentProcessExplicitAppUserModelID(wide.as_ptr()) };
+    if hr != 0 {
+        log(&format!(
+            "ember: SetCurrentProcessExplicitAppUserModelID = 0x{hr:08x}"
+        ));
+    }
+}
+
+/// IAT hook detour: substitutes `EMBER_AUMID` regardless of the caller's argument.
+unsafe extern "system" fn set_aumid_detour(_app_id: *const u16) -> i32 {
+    let wide: Vec<u16> = EMBER_AUMID.encode_utf16().chain(std::iter::once(0)).collect();
+    let real = REAL_SET_AUMID.load(Ordering::Acquire);
+    if real.is_null() {
+        return -1;
+    }
+    let f: unsafe extern "system" fn(*const u16) -> i32 =
+        unsafe { std::mem::transmute(real) };
+    unsafe { f(wide.as_ptr()) }
+}
+
+/// Walk the main module's PE import table and hook
+/// `SetCurrentProcessExplicitAppUserModelID` in shell32.dll so every caller
+/// (including Discord itself) ends up setting our AUMID.
+///
+/// # Safety
+/// Must be called in a live process whose main module is a valid PE32+ image.
+unsafe fn hook_iat_set_aumid() -> Result<(), String> {
+    let base = unsafe { GetModuleHandleW(std::ptr::null()) } as *const u8;
+    if base.is_null() {
+        return Err("GetModuleHandleW(null) failed".into());
+    }
+    unsafe {
+        let rd_u16 = |off: usize| -> u16 {
+            u16::from_le_bytes([*base.add(off), *base.add(off + 1)])
+        };
+        let rd_u32 = |off: usize| -> u32 {
+            u32::from_le_bytes([
+                *base.add(off),
+                *base.add(off + 1),
+                *base.add(off + 2),
+                *base.add(off + 3),
+            ])
+        };
+
+        if rd_u16(0) != 0x5A4D {
+            return Err("no MZ".into());
+        }
+        let pe = rd_u32(0x3C) as usize;
+        if rd_u32(pe) != 0x0000_4550 {
+            return Err("no PE sig".into());
+        }
+        let opt = pe + 24;
+        if rd_u16(opt) != 0x020B {
+            return Err("not PE32+".into());
+        }
+
+        // Import directory (data directory index 1, at opt + 112 + 1*8)
+        let import_rva = rd_u32(opt + 120) as usize;
+        if import_rva == 0 {
+            return Err("no import directory".into());
+        }
+
+        // Walk IMAGE_IMPORT_DESCRIPTORs (20 bytes each, null-terminated)
+        let mut desc = import_rva;
+        loop {
+            let name_rva = rd_u32(desc + 12) as usize;
+            if name_rva == 0 {
+                break;
+            }
+            if ascii_eq_ci(base.add(name_rva), b"shell32.dll") {
+                let oft_rva = rd_u32(desc) as usize;
+                let ft_rva = rd_u32(desc + 16) as usize;
+                // Some linkers leave OriginalFirstThunk zero.
+                let names = if oft_rva != 0 { oft_rva } else { ft_rva };
+                let mut i = 0usize;
+                loop {
+                    let entry = *(base.add(names + i * 8) as *const u64);
+                    if entry == 0 {
+                        break;
+                    }
+                    // Skip ordinal imports (bit 63 set).
+                    if entry & (1u64 << 63) == 0 {
+                        let fn_name = base.add(entry as usize + 2); // skip hint u16
+                        if ascii_eq(
+                            fn_name,
+                            b"SetCurrentProcessExplicitAppUserModelID",
+                        ) {
+                            let iat_slot =
+                                base.add(ft_rva + i * 8) as *mut usize;
+                            REAL_SET_AUMID
+                                .store(*iat_slot as *mut c_void, Ordering::Release);
+                            let mut old: PAGE_PROTECTION_FLAGS = 0;
+                            VirtualProtect(
+                                iat_slot.cast(),
+                                8,
+                                PAGE_EXECUTE_READWRITE,
+                                &mut old,
+                            );
+                            *iat_slot = set_aumid_detour as *const () as usize;
+                            VirtualProtect(iat_slot.cast(), 8, old, &mut old);
+                            return Ok(());
+                        }
+                    }
+                    i += 1;
+                }
+                // shortcut: only hooks the main EXE's IAT, not loaded DLLs
+                return Err("function not in shell32 IAT".into());
+            }
+            desc += 20;
+        }
+        Err("shell32.dll not in imports".into())
+    }
+}
+
+/// Case-insensitive match of a null-terminated C string against `name`.
+unsafe fn ascii_eq_ci(ptr: *const u8, name: &[u8]) -> bool {
+    for (i, &b) in name.iter().enumerate() {
+        if unsafe { (*ptr.add(i)).to_ascii_lowercase() } != b.to_ascii_lowercase() {
+            return false;
+        }
+    }
+    unsafe { *ptr.add(name.len()) == 0 }
+}
+
+/// Exact match of a null-terminated C string against `name`.
+unsafe fn ascii_eq(ptr: *const u8, name: &[u8]) -> bool {
+    for (i, &b) in name.iter().enumerate() {
+        if unsafe { *ptr.add(i) } != b {
+            return false;
+        }
+    }
+    unsafe { *ptr.add(name.len()) == 0 }
+}
+
+// ── Logging ────────────────────────────────────────────────────────────
 
 /// Minimal logging to a file next to the DLL's working dir. We avoid pulling in a
 /// logging crate for v1; a line in `%TEMP%\ember.log` is enough to see results.
