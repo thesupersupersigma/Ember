@@ -1,5 +1,7 @@
 # Ember
 
+[![Discord](https://img.shields.io/badge/discord-join-5865F2)](https://discord.gg/trvtVNWzaf)
+
 Ember unlocks **Discord Phoenix** (Discord's native Rust client) on Windows x64
 and runs it past its access gate, so it opens for any logged-in account.
 
