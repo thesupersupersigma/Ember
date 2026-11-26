@@ -1,4 +1,4 @@
-use crate::{Plugin, PluginCtx, RequestAction, RequestFilter};
+use crate::{Plugin, PluginCtx, RequestFilter};
 
 pub(crate) struct Unindent;
 
@@ -81,6 +81,11 @@ fn unindent_message(text: &str) -> String {
     result
 }
 
+fn unindent_handler(req: &crate::RequestInfo) -> crate::RequestAction {
+    crate::transform_message_content(req.body, unindent_message)
+        .map_or(crate::RequestAction::Pass, crate::RequestAction::Replace)
+}
+
 impl Plugin for Unindent {
     fn name(&self) -> &str {
         "unindent"
@@ -92,23 +97,23 @@ impl Plugin for Unindent {
         "thesupersupersigma"
     }
     fn register(&self, ctx: &mut PluginCtx) {
-        // Matches message send and edit. Body access needed to apply the
-        // transform; returns Pass until RequestInfo gains a body field.
         ctx.on_request(
             RequestFilter {
                 method: Some("POST"),
                 path_prefix: Some("/channels/"),
                 path_suffix: Some("/messages"),
             },
-            |_req| RequestAction::Pass,
+            unindent_handler,
         );
         ctx.on_request(
             RequestFilter {
                 method: Some("PATCH"),
                 path_prefix: Some("/channels/"),
-                path_suffix: None, // shortcut: also matches non-message PATCHes under /channels/, upgrade when body access lands
+                path_suffix: None, // shortcut: also matches non-message PATCHes, safe
+                // because transform_message_content returns None for bodies
+                // without a string "content" field
             },
-            |_req| RequestAction::Pass,
+            unindent_handler,
         );
     }
 }
@@ -170,5 +175,24 @@ mod tests {
     fn no_indentation_no_change() {
         let input = "```\nfoo\nbar\n```";
         assert_eq!(unindent_message(input), input);
+    }
+
+    #[test]
+    fn body_transform_unindents() {
+        let body =
+            br#"{"content":"```rust\n    fn main() {\n        println!(\"hi\");\n    }\n```","nonce":"1"}"#;
+        let result = crate::transform_message_content(body, unindent_message);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(result.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            parsed["content"],
+            "```rust\nfn main() {\n    println!(\"hi\");\n}\n```"
+        );
+    }
+
+    #[test]
+    fn body_transform_no_codeblocks_passes() {
+        let body = br#"{"content":"just text","nonce":"1"}"#;
+        assert!(crate::transform_message_content(body, unindent_message).is_none());
     }
 }

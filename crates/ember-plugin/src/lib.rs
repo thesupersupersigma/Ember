@@ -26,7 +26,8 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -88,6 +89,7 @@ impl RequestFilter {
 pub struct RequestInfo<'a> {
     pub method: &'a str,
     pub path: &'a str,
+    pub body: &'a [u8],
 }
 
 /// What a gateway event hook tells the dispatcher to do.
@@ -197,11 +199,36 @@ struct RawMethod {
     bytes: [u8; 24],
 }
 
+#[repr(C)]
+struct RawBytesVtable {
+    clone:     unsafe extern "C" fn(&AtomicPtr<()>, *const u8, usize) -> RawBytes,
+    to_vec:    unsafe extern "C" fn(*mut (), *const u8, usize) -> RawVec,
+    to_mut:    unsafe extern "C" fn(*mut (), *const u8, usize) -> RawBytes,
+    is_unique: unsafe extern "C" fn(&AtomicPtr<()>) -> bool,
+    drop:      unsafe extern "C" fn(*mut (), *const u8, usize),
+}
+
+#[repr(C)]
+struct RawBytes {
+    vtable: *const RawBytesVtable,
+    ptr:    *const u8,
+    len:    usize,
+    data:   AtomicPtr<()>,
+}
+
+#[repr(C)]
+struct RawBody {
+    tag:   u64,
+    bytes: RawBytes,
+    _rest: [u64; 2],
+}
+const _: () = assert!(size_of::<RawBody>() == 0x38);
+
 /// Mirror of `libdiscord/crates/http`'s `TransportRequest`.
 #[repr(C)]
 struct RawTransportRequest {
     _headers: [u8; 0x60], // RawHeaderMap
-    _body: [u8; 0x38],    // RawBody
+    body: RawBody,
     url: RawVec,           // offset 0x98
     _timeout: [u8; 0x10],
     method: RawMethod,     // offset 0xC0
@@ -259,6 +286,141 @@ const GATEWAY_SIG: &str = "\
     48 8D 0D ?? ?? ?? ?? \
     4C 8D 44 24 44 \
     BA 0E 00 00 00";
+
+// =========================================================================
+// Allocator-isolated bytes::Bytes vtable for replaced request bodies
+// =========================================================================
+// Mirrors the sunbird reference design: replaced bodies live in Ember's heap
+// (the injected DLL), and this vtable makes the host's drop call back into
+// our allocator instead of its own.
+
+static OWNED_BYTES_VTABLE: RawBytesVtable = RawBytesVtable {
+    clone:     owned_bytes_clone,
+    to_vec:    owned_bytes_to_vec,
+    to_mut:    owned_bytes_to_mut,
+    is_unique: owned_bytes_is_unique,
+    drop:      owned_bytes_drop,
+};
+
+fn make_owned_bytes(data: Vec<u8>) -> RawBytes {
+    let arc = Arc::new(data);
+    let ptr = arc.as_ptr();
+    let len = arc.len();
+    let raw = Arc::into_raw(arc).cast_mut().cast::<()>();
+    RawBytes {
+        vtable: std::ptr::addr_of!(OWNED_BYTES_VTABLE),
+        ptr,
+        len,
+        data: AtomicPtr::new(raw),
+    }
+}
+
+unsafe extern "C" fn owned_bytes_clone(
+    data: &AtomicPtr<()>,
+    ptr: *const u8,
+    len: usize,
+) -> RawBytes {
+    let raw = data.load(Ordering::Relaxed);
+    if !raw.is_null() {
+        unsafe { Arc::increment_strong_count(raw.cast::<Vec<u8>>()) };
+    }
+    RawBytes {
+        vtable: std::ptr::addr_of!(OWNED_BYTES_VTABLE),
+        ptr,
+        len,
+        data: AtomicPtr::new(raw),
+    }
+}
+
+unsafe extern "C" fn owned_bytes_to_vec(
+    data: *mut (),
+    ptr: *const u8,
+    len: usize,
+) -> RawVec {
+    // shortcut: host __rust_alloc not resolved; returns empty Vec, upgrade
+    // when host allocator is located (only needed if the host calls to_vec
+    // on a replaced body, which the reqwest send path does not).
+    unsafe { owned_bytes_drop(data, ptr, len) };
+    RawVec {
+        cap: 0,
+        ptr: std::ptr::null_mut(),
+        len: 0,
+    }
+}
+
+unsafe extern "C" fn owned_bytes_to_mut(
+    data: *mut (),
+    ptr: *const u8,
+    len: usize,
+) -> RawBytes {
+    RawBytes {
+        vtable: std::ptr::addr_of!(OWNED_BYTES_VTABLE),
+        ptr,
+        len,
+        data: AtomicPtr::new(data),
+    }
+}
+
+unsafe extern "C" fn owned_bytes_is_unique(_data: &AtomicPtr<()>) -> bool {
+    false
+}
+
+unsafe extern "C" fn owned_bytes_drop(data: *mut (), _ptr: *const u8, _len: usize) {
+    if !data.is_null() {
+        drop(unsafe { Arc::from_raw(data.cast::<Vec<u8>>()) });
+    }
+}
+
+// =========================================================================
+// Body read / replace
+// =========================================================================
+
+fn read_body(body: &RawBody) -> &[u8] {
+    if body.tag != 1
+        || body.bytes.ptr.is_null()
+        || body.bytes.len == 0
+        || body.bytes.len > 128 * 1024 * 1024
+    {
+        return &[];
+    }
+    // SAFETY: tag == 1 means Body::Bytes; ptr and len are valid for the
+    // request's lifetime.
+    unsafe { std::slice::from_raw_parts(body.bytes.ptr, body.bytes.len) }
+}
+
+/// Replace the request body, freeing the old one through its vtable.
+///
+/// # Safety
+///
+/// `body` must be a live `RawBody` from the host's `TransportRequest`.
+unsafe fn replace_body(body: &mut RawBody, new_data: Vec<u8>) {
+    if body.tag == 1 && !body.bytes.vtable.is_null() {
+        let old_vtable = body.bytes.vtable;
+        let old_ptr = body.bytes.ptr;
+        let old_len = body.bytes.len;
+        let old_data = body.bytes.data.load(Ordering::Relaxed);
+        unsafe { ((*old_vtable).drop)(old_data, old_ptr, old_len) };
+    }
+    body.tag = 1;
+    body.bytes = make_owned_bytes(new_data);
+}
+
+/// Parse a message JSON body, transform its `"content"` field, and return
+/// the modified JSON bytes. Returns `None` if the body isn't a JSON object
+/// with a string `"content"` field, or if the transform produces no change.
+pub(crate) fn transform_message_content(
+    body: &[u8],
+    transform: impl FnOnce(&str) -> String,
+) -> Option<Vec<u8>> {
+    let mut json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let content = json.get("content")?.as_str()?;
+    let new_content = transform(content);
+    if new_content == content {
+        return None;
+    }
+    json["content"] = serde_json::Value::String(new_content);
+    serde_json::to_vec(&json).ok()
+}
 
 // =========================================================================
 // install()
@@ -345,15 +507,22 @@ unsafe fn send_detour(
             let url = read_url(&req_ref.url);
 
             if let Some(path) = api_path(url) {
-                match run_hooks(method, path) {
+                // Scope `body` so the immutable borrow of req_ref.body ends
+                // before the Replace arm takes a mutable borrow.
+                let action = {
+                    let body = read_body(&req_ref.body);
+                    run_hooks(method, path, body)
+                };
+                match action {
                     RequestAction::Pass => {}
                     RequestAction::Drop => {
                         // Zero url.len → Url::parse("") fails → no network I/O.
                         // The host's String capacity/pointer stay intact for cleanup.
                         req_ref.url.len = 0;
                     }
-                    RequestAction::Replace(_body) => {
-                        // TODO(v2): body replacement needs host allocator awareness
+                    RequestAction::Replace(new_body) => {
+                        // SAFETY: body is a live RawBody from the host's request.
+                        unsafe { replace_body(&mut req_ref.body, new_body) };
                     }
                 }
             }
@@ -364,11 +533,11 @@ unsafe fn send_detour(
     unsafe { tramp(self_ptr, req) }
 }
 
-fn run_hooks(method: &str, path: &str) -> RequestAction {
+fn run_hooks(method: &str, path: &str, body: &[u8]) -> RequestAction {
     let Ok(hooks) = hooks().lock() else {
         return RequestAction::Pass;
     };
-    let info = RequestInfo { method, path };
+    let info = RequestInfo { method, path, body };
     for hook in hooks.iter() {
         if hook.filter.matches(method, path) {
             match (hook.handler)(&info) {
@@ -898,6 +1067,88 @@ mod tests {
         assert_eq!(size_of::<RawTransportRequest>(), 0xF0);
         assert_eq!(size_of::<RawMethod>(), 0x18);
         assert_eq!(size_of::<RawVec>(), 0x18);
+        assert_eq!(size_of::<RawBody>(), 0x38);
+        assert_eq!(size_of::<RawBytes>(), 0x20);
+    }
+
+    #[test]
+    fn read_body_tag_one() {
+        let data = b"hello body";
+        let body = RawBody {
+            tag: 1,
+            bytes: RawBytes {
+                vtable: std::ptr::null(),
+                ptr: data.as_ptr(),
+                len: data.len(),
+                data: AtomicPtr::new(std::ptr::null_mut()),
+            },
+            _rest: [0; 2],
+        };
+        assert_eq!(read_body(&body), b"hello body");
+    }
+
+    #[test]
+    fn read_body_tag_zero() {
+        let body = RawBody {
+            tag: 0,
+            bytes: RawBytes {
+                vtable: std::ptr::null(),
+                ptr: std::ptr::null(),
+                len: 0,
+                data: AtomicPtr::new(std::ptr::null_mut()),
+            },
+            _rest: [0; 2],
+        };
+        assert_eq!(read_body(&body), b"");
+    }
+
+    #[test]
+    fn owned_bytes_clone_drop_roundtrip() {
+        let raw = make_owned_bytes(b"test ember".to_vec());
+        assert_eq!(raw.len, 10);
+        let bytes = unsafe { std::slice::from_raw_parts(raw.ptr, raw.len) };
+        assert_eq!(bytes, b"test ember");
+        unsafe {
+            let cloned = ((*raw.vtable).clone)(&raw.data, raw.ptr, raw.len);
+            assert_eq!(cloned.len, 10);
+            ((*raw.vtable).drop)(
+                raw.data.load(Ordering::Relaxed),
+                raw.ptr,
+                raw.len,
+            );
+            ((*cloned.vtable).drop)(
+                cloned.data.load(Ordering::Relaxed),
+                cloned.ptr,
+                cloned.len,
+            );
+        }
+    }
+
+    #[test]
+    fn transform_content_basic() {
+        let body = br#"{"content":"hello world","nonce":"123"}"#;
+        let result = transform_message_content(body, |s| s.replace("hello", "hi"));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(result.as_ref().unwrap()).unwrap();
+        assert_eq!(parsed["content"], "hi world");
+        assert_eq!(parsed["nonce"], "123");
+    }
+
+    #[test]
+    fn transform_content_unchanged() {
+        let body = br#"{"content":"hello","nonce":"1"}"#;
+        assert!(transform_message_content(body, |s| s.to_string()).is_none());
+    }
+
+    #[test]
+    fn transform_content_no_content_field() {
+        let body = br#"{"nonce":"1"}"#;
+        assert!(transform_message_content(body, |_| "x".into()).is_none());
+    }
+
+    #[test]
+    fn transform_content_not_json() {
+        assert!(transform_message_content(b"not json", |_| "x".into()).is_none());
     }
 
     #[test]

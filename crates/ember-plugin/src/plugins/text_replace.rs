@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use crate::{Plugin, PluginCtx, RequestAction, RequestFilter};
 
 pub(crate) struct TextReplace;
@@ -40,6 +42,20 @@ fn apply_rules(content: &str, rules: &[Rule]) -> String {
         .fold(content.to_owned(), |acc, r| acc.replace(&r.find, &r.replace))
 }
 
+/// Load rules once from `%APPDATA%\ember\text_replace.txt`.
+fn loaded_rules() -> &'static [Rule] {
+    static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let Ok(dir) = std::env::var("APPDATA") else {
+            return Vec::new();
+        };
+        let path = format!("{dir}\\ember\\text_replace.txt");
+        std::fs::read_to_string(path)
+            .map(|text| parse_rules(&text))
+            .unwrap_or_default()
+    })
+}
+
 impl Plugin for TextReplace {
     fn name(&self) -> &str {
         "text-replace"
@@ -57,10 +73,15 @@ impl Plugin for TextReplace {
                 path_prefix: Some("/channels/"),
                 path_suffix: Some("/messages"),
             },
-            |_req| {
-                // TODO: RequestInfo has no body field yet — pass through until
-                // body access lands, then apply_rules on the message content.
-                RequestAction::Pass
+            |req| {
+                let rules = loaded_rules();
+                if rules.is_empty() {
+                    return RequestAction::Pass;
+                }
+                crate::transform_message_content(req.body, |text| {
+                    apply_rules(text, rules)
+                })
+                .map_or(RequestAction::Pass, RequestAction::Replace)
             },
         );
     }
@@ -167,5 +188,29 @@ mod tests {
         assert!(filter.matches("POST", "/channels/123456789/messages"));
         assert!(!filter.matches("GET", "/channels/123/messages"));
         assert!(!filter.matches("POST", "/channels/123/typing"));
+    }
+
+    // ── body transform ──────────────────────────────────────────
+
+    #[test]
+    fn body_transform_applies_rules() {
+        let rules = parse_rules("hello=>hi\nworld=>earth");
+        let body = br#"{"content":"hello world","nonce":"1"}"#;
+        let result = crate::transform_message_content(body, |text| {
+            apply_rules(text, &rules)
+        });
+        let parsed: serde_json::Value =
+            serde_json::from_slice(result.as_ref().unwrap()).unwrap();
+        assert_eq!(parsed["content"], "hi earth");
+        assert_eq!(parsed["nonce"], "1");
+    }
+
+    #[test]
+    fn body_transform_no_match_passes() {
+        let rules = parse_rules("xyz=>123");
+        let body = br#"{"content":"hello world","nonce":"1"}"#;
+        assert!(
+            crate::transform_message_content(body, |text| apply_rules(text, &rules)).is_none()
+        );
     }
 }

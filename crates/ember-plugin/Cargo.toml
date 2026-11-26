@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 ember-sig = { path = "../ember-sig" }
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [lints]
 workspace = true

@@ -13,19 +13,17 @@ impl Plugin for ClearUrls {
         "thesupersupersigma"
     }
     fn register(&self, ctx: &mut PluginCtx) {
-        // TODO: body access needed — RequestInfo has method+path only, so the
-        // handler cannot read or rewrite message content yet. Returns Pass
-        // until RequestInfo gains a body field.
         ctx.on_request(
             RequestFilter {
                 method: Some("POST"),
                 path_prefix: Some("/channels/"),
                 path_suffix: Some("/messages"),
             },
-            |_req| RequestAction::Pass,
+            |req| {
+                crate::transform_message_content(req.body, clean_urls)
+                    .map_or(RequestAction::Pass, RequestAction::Replace)
+            },
         );
-        // TODO: also hook PATCH /channels/{id}/messages/{id} for edits once
-        // RequestFilter supports path-contains or body access lands.
     }
 }
 
@@ -444,5 +442,21 @@ mod tests {
     fn question_mark_no_url() {
         let text = "what? nothing here?";
         assert_eq!(clean_urls(text), text);
+    }
+
+    #[test]
+    fn body_transform_strips_trackers() {
+        let body = br#"{"content":"check https://example.com?utm_source=tw","nonce":"1"}"#;
+        let result = crate::transform_message_content(body, |text| clean_urls(text));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(result.as_ref().unwrap()).unwrap();
+        assert_eq!(parsed["content"], "check https://example.com");
+        assert_eq!(parsed["nonce"], "1");
+    }
+
+    #[test]
+    fn body_transform_no_trackers_passes() {
+        let body = br#"{"content":"hello world","nonce":"1"}"#;
+        assert!(crate::transform_message_content(body, |text| clean_urls(text)).is_none());
     }
 }

@@ -75,6 +75,37 @@ The `SendFuture::poll` vtable slots can be found by:
 Response interception requires swapping these vtable entries. Not needed for v1
 (silent-typing only hooks outgoing requests).
 
+## Request body — RawBody (0x38 bytes)
+
+Layout at offset 0x60 within `RawTransportRequest`, verified against the sunbird
+reference for build 0.1.0.2208:
+
+| Offset | Size | Field    | Type              | Notes                              |
+|--------|------|----------|-------------------|------------------------------------|
+| 0x00   | 0x08 | tag      | u64               | 0 = None, 1 = Bytes               |
+| 0x08   | 0x08 | vtable   | *const BytesVtable| bytes::Bytes vtable (tag == 1)     |
+| 0x10   | 0x08 | ptr      | *const u8         | Pointer to byte data               |
+| 0x18   | 0x08 | len      | usize             | Byte count                         |
+| 0x20   | 0x08 | data     | AtomicPtr<()>     | Shared ownership / refcount data   |
+| 0x28   | 0x10 | _rest    | [u64; 2]          | Padding                            |
+
+The vtable has five slots: `clone`, `to_vec`, `to_mut`, `is_unique`, `drop`.
+
+**Reading**: when `tag == 1`, read bytes at `(ptr, len)`. Any other tag = no body.
+
+**Replacing**: drop the old `Bytes` through `(*vtable).drop(data, ptr, len)`, then
+install a new `RawBytes` backed by an `Arc<Vec<u8>>` with a custom vtable.  The
+custom vtable routes `drop` and `clone` through Ember's allocator (the injected DLL
+heap).  `to_vec` currently returns empty — host allocator not yet resolved.  This is
+safe because reqwest reads body bytes via `Buf` (ptr + len), not `to_vec`.
+
+**Host allocator** (future work): `__rust_alloc` and `__rust_dealloc` in
+`Discord.exe` are needed for `to_vec` and response body replacement.  Sunbird
+locates them by tracing the `Box::pin` call inside `Transport::send`.
+
+**Safety**: on any unexpected condition (tag not 0 or 1, null vtable, corrupted
+length), the hook leaves the body untouched and passes the original request.
+
 ## Confidence and open questions
 
 - **High**: anchor string is unique and stable across nearby builds.

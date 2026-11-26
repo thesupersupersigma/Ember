@@ -19,9 +19,9 @@ impl Plugin for SendTimestamps {
                 path_prefix: Some("/channels/"),
                 path_suffix: Some("/messages"),
             },
-            |_req| {
-                // TODO: needs RequestInfo body access to call replace_timestamps on message content
-                RequestAction::Pass
+            |req| {
+                crate::transform_message_content(req.body, replace_timestamps)
+                    .map_or(RequestAction::Pass, RequestAction::Replace)
             },
         );
     }
@@ -136,9 +136,7 @@ fn replace_timestamps_with_ref(text: &str, now_secs: i64, utc_offset_secs: i32) 
     out
 }
 
-// TODO: wire into hook when RequestInfo gains body access
 /// Replace backtick-wrapped time patterns using system clock (UTC until TZ API is wired).
-#[allow(dead_code)]
 pub(crate) fn replace_timestamps(text: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -274,5 +272,23 @@ mod tests {
         assert!(filter.matches("POST", "/channels/123456789/messages"));
         assert!(!filter.matches("GET", "/channels/123/messages"));
         assert!(!filter.matches("POST", "/channels/123/typing"));
+    }
+
+    #[test]
+    fn body_transform_replaces_time() {
+        let body = br#"{"content":"meet at `23:00` ok?","nonce":"1"}"#;
+        let result = crate::transform_message_content(body, |text| {
+            replace_timestamps_with_ref(text, NOW, UTC)
+        });
+        let parsed: serde_json::Value =
+            serde_json::from_slice(result.as_ref().unwrap()).unwrap();
+        assert_eq!(parsed["content"], "meet at <t:1700002800:t> ok?");
+        assert_eq!(parsed["nonce"], "1");
+    }
+
+    #[test]
+    fn body_transform_no_times_passes() {
+        let body = br#"{"content":"no times here","nonce":"1"}"#;
+        assert!(crate::transform_message_content(body, replace_timestamps).is_none());
     }
 }
