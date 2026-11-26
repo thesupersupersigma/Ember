@@ -49,6 +49,20 @@ Keep both files in the same folder.
 > `Compiling` lines, cargo reused a stale cache. Run `cargo clean` first, then
 > rebuild.
 
+## Install
+
+After building (or downloading a release), double-click `ember-launcher.exe` to
+open the installer wizard. It copies Ember to `%LOCALAPPDATA%\Ember\` and creates
+shortcuts so you can launch Discord through Ember from the Start Menu or Desktop.
+
+To remove Ember:
+
+```
+ember-launcher.exe --uninstall
+```
+
+Discord itself is never modified.
+
 ## Run
 
 1. Fully quit Discord Phoenix (a second instance hands off to the running one).

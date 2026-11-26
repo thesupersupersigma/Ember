@@ -24,3 +24,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemServices",
     "Win32_UI_WindowsAndMessaging",
 ] }
+native-windows-gui = "1.0"
+native-windows-derive = "1.0"
