@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ember-sig = { path = "../ember-sig" }
+ember-plugin = { path = "../ember-plugin" }
 
 [lints]
 workspace = true

@@ -4,6 +4,7 @@ members = [
     "crates/ember-sig",
     "crates/ember-inject",
     "crates/ember-core",
+    "crates/ember-plugin",
 ]
 
 [workspace.package]

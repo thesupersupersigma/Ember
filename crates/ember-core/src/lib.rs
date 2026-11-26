@@ -100,6 +100,12 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
             } else {
                 log("ember: patch still in place after recheck — looks stable");
             }
+
+            // Install the HTTP request hook and built-in plugins.
+            match ember_plugin::install() {
+                Ok(()) => log("ember: plugin system installed"),
+                Err(e) => log(&format!("ember: plugin install failed: {e}")),
+            }
             0
         }
         Err(e) => {
