@@ -29,6 +29,8 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::ProcessStatus::{GetModuleInformation, MODULEINFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
+mod plugins;
+
 // =========================================================================
 // Public API
 // =========================================================================
@@ -218,7 +220,9 @@ pub fn install() -> Result<(), String> {
 
         // 5. Register built-in plugins
         let mut ctx = PluginCtx;
-        SilentTyping.register(&mut ctx);
+        for plugin in plugins::builtins() {
+            plugin.register(&mut ctx);
+        }
 
         log("ember-plugin: hooks installed, silent-typing active");
         Ok(())
@@ -312,34 +316,6 @@ fn api_path(url: &str) -> Option<&str> {
     }
     let rest = &url[after + digit_end..];
     rest.starts_with('/').then_some(rest)
-}
-
-// =========================================================================
-// Silent-typing plugin
-// =========================================================================
-
-struct SilentTyping;
-
-impl Plugin for SilentTyping {
-    fn name(&self) -> &str {
-        "silent-typing"
-    }
-    fn version(&self) -> &str {
-        "1.0.0"
-    }
-    fn author(&self) -> &str {
-        "ember"
-    }
-    fn register(&self, ctx: &mut PluginCtx) {
-        ctx.on_request(
-            RequestFilter {
-                method: Some("POST"),
-                path_prefix: Some("/channels/"),
-                path_suffix: Some("/typing"),
-            },
-            |_req| RequestAction::Drop,
-        );
-    }
 }
 
 // =========================================================================
@@ -643,31 +619,6 @@ fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn filter_matches_silent_typing() {
-        let filter = RequestFilter {
-            method: Some("POST"),
-            path_prefix: Some("/channels/"),
-            path_suffix: Some("/typing"),
-        };
-        assert!(filter.matches("POST", "/channels/123456789/typing"));
-        assert!(filter.matches("post", "/channels/999/typing"));
-        assert!(!filter.matches("GET", "/channels/123/typing"));
-        assert!(!filter.matches("POST", "/channels/123/messages"));
-        assert!(!filter.matches("POST", "/users/@me/typing"));
-    }
-
-    #[test]
-    fn filter_strips_query_string() {
-        let filter = RequestFilter {
-            method: None,
-            path_prefix: Some("/channels/"),
-            path_suffix: Some("/typing"),
-        };
-        assert!(filter.matches("POST", "/channels/123/typing?nonce=abc"));
-        assert!(filter.matches("POST", "/channels/123/typing#frag"));
-    }
 
     #[test]
     fn filter_pass_all() {
