@@ -1,0 +1,10 @@
+[package]
+name = "ember-sig"
+description = "Pattern/signature scanning over a mapped PE image — Ember's find-the-code engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
