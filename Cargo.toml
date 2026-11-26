@@ -16,9 +16,8 @@ repository = ""
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
-# ember.exe (bin "ember") and ember.dll (lib "ember") both emit ember.pdb, which
-# collides. We don't ship pdbs for v1, so strip debuginfo in release — this also
-# removes the collision warning and shrinks the binaries.
+# Launcher is ember-launcher.exe and the DLL is ember.dll — different base names,
+# so their .pdb files no longer collide. Strip symbols; v1 ships no pdbs.
 [profile.release]
 debug = false
-strip = "debuginfo"
+strip = "symbols"

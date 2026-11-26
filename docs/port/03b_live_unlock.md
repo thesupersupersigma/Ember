@@ -30,7 +30,7 @@ Outputs:
 ## Run (first live attempt)
 1. Fully quit Discord Phoenix (a second instance hands off to the running one).
 2. Put `ember.exe` and `ember.dll` in the same folder (e.g. target\release).
-3. Run `ember.exe`. It launches the default Phoenix with ember.dll injected.
+3. Run `ember-launcher.exe`. It launches the default Phoenix with ember.dll injected.
    - Or point it explicitly:
      `ember.exe --exe "C:\...\ignored\DiscordPhoenix\app\Discord.exe"`
      (note: the ignored copy has a live token — prefer the real install path).

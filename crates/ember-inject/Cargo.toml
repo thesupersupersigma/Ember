@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "ember"
+name = "ember-launcher"
 path = "src/main.rs"
 
 [lints]

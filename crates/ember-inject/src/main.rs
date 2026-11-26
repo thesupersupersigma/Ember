@@ -73,7 +73,7 @@ mod win {
                     break;
                 }
                 "-h" | "--help" => {
-                    println!("usage: ember [--dll <ember.dll>] [--exe <Discord.exe>] [-- <discord args>]");
+                    println!("usage: ember-launcher [--dll <ember.dll>] [--exe <Discord.exe>] [-- <discord args>]");
                     return Ok(());
                 }
                 other => return Err(format!("unknown argument: {other}")),
