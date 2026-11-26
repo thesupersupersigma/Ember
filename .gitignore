@@ -1,1 +1,11 @@
+# local Discord copy + any live account secrets — never commit
 ignored/
+prompts/
+
+# design doc is kept local for now (Super's choice on rustyAC too)
+brainstorm.md
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock

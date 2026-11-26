@@ -1,0 +1,13 @@
+[package]
+name = "ember-inject"
+description = "ember.exe — starts Discord Phoenix suspended and loads ember.dll first (APC)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# windows-sys added when we implement injection (CreateProcessW, QueueUserAPC, ...)

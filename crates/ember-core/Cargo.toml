@@ -1,0 +1,16 @@
+[package]
+name = "ember-core"
+description = "ember.dll — injected into Discord Phoenix; applies the access-gate patch (v1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ember-sig = { path = "../ember-sig" }
+
+[lints]
+workspace = true
