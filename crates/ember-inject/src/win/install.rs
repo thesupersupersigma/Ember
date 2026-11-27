@@ -199,7 +199,7 @@ public class LnkAumid {
     public static void Set(string lnkPath, string aumid) {
         object link = new ShellLink();
         try {
-            ((IPersistFile)link).Load(lnkPath, 0);
+            ((IPersistFile)link).Load(lnkPath, 2); // STGM_READWRITE
             var store = (IPropertyStore)link;
             var val = new PropVariant { vt = 31, p = Marshal.StringToCoTaskMemUni(aumid) };
             store.SetValue(ref PKEY, ref val);
@@ -212,6 +212,9 @@ public class LnkAumid {
 '@
 $dirs = @([Environment]::GetFolderPath('Programs'))
 if ($env:EMBER_AUMID_DESKTOP -eq '1') { $dirs += [Environment]::GetFolderPath('Desktop') }
+# Also update the pinned taskbar copy (stale pin = mismatched AUMID = two icons)
+$tb = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+if (Test-Path $tb) { $dirs += $tb }
 foreach ($dir in $dirs) {
     $p = Join-Path $dir 'Ember.lnk'
     if (Test-Path $p) { [LnkAumid]::Set($p, $env:EMBER_AUMID) }

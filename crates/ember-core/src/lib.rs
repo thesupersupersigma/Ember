@@ -94,6 +94,12 @@ static REAL_SET_AUMID: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 #[no_mangle]
 pub extern "system" fn DllMain(_dll: HMODULE, reason: u32, _reserved: *mut c_void) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
+        // Set AUMID on the main thread BEFORE Discord creates any windows.
+        // Safe: IAT hook is pure memory writes; shell32 is already loaded
+        // (Discord imports it) so SetCurrentProcessExplicitAppUserModelID
+        // won't trigger a DLL load.
+        set_process_aumid();
+
         // SAFETY: standard thread spawn; worker does its own error handling.
         unsafe {
             CreateThread(
@@ -110,8 +116,7 @@ pub extern "system" fn DllMain(_dll: HMODULE, reason: u32, _reserved: *mut c_voi
 }
 
 extern "system" fn worker(_param: *mut c_void) -> u32 {
-    // Set process AUMID before Discord's window is created (taskbar grouping).
-    set_process_aumid();
+    // Process AUMID is now set from DllMain (main thread, before window creation).
 
     let rc = match apply_unlock() {
         Ok(site) => {
